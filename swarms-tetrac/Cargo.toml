@@ -1,0 +1,27 @@
+[package]
+name = "swarms-tetrac"
+version = "0.1.0"
+edition = "2024"
+description = "TTC (ttc.box) integration tools for swarms-rs agents."
+authors = ["tetrac-official"]
+license = "Apache-2.0"
+repository = "https://github.com/tetrac-official/swarms-rs"
+readme = "README.md"
+keywords = ["ttc", "trading", "swarms", "agents", "crypto"]
+categories = ["api-bindings"]
+
+[dependencies]
+swarms-rs = { path = "../swarms-rs" }
+
+tokio = { version = "1", features = ["full"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { version = "0.8", features = ["derive"] }
+
+thiserror = "2"
+tracing = "0.1"
+
+# skill-trading client lands in D3; left out of D2 so the scaffold
+# compiles without the sibling repo present.
+# skill-trading = { path = "../../rust-cli-ttc-api" }
