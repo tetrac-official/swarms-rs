@@ -14,6 +14,33 @@ contribute upstream. Treat upstream as frozen reference code.
 - The `upstream` remote exists for read-only reference; do not push
   to it, do not fetch+merge from it without an explicit ask.
 
+## DevOps cycle (every change to `swarms-tetrac`)
+
+Run these in order before merging a feature branch into `main`:
+
+1. **Write tests first** for any new module or behavior. Pure-logic
+   tests live next to the code in `#[cfg(test)] mod tests`. Tests
+   that touch process env vars must serialize via a `Mutex<()>` and
+   wrap `set_var` / `remove_var` in `unsafe { ... }` (Rust 2024).
+2. `cargo test -p swarms-tetrac` — must be green.
+3. `cargo build -p swarms-tetrac` — must succeed without errors.
+4. `cargo clippy -p swarms-tetrac --all-targets` — zero warnings
+   on our code. Upstream warnings in `swarms-rs/` and `swarms-macro/`
+   are pre-existing and ignored; do **not** add `-D warnings` (it
+   would fail on those).
+5. **Clean up** before committing: remove dead code, unused imports,
+   any debug `dbg!` / `println!`, and unrelated whitespace churn.
+6. Commit with a focused message; squash sibling fixups into the
+   feature commit before merge if it keeps history readable.
+7. `git checkout main && git merge <branch>` (fast-forward when
+   possible). Then create the next feature branch off `main`.
+
+If any step fails, fix the underlying cause — don't bypass it with
+`--no-verify`, `#[allow]` blanket suppressions, or skipping tests.
+The one allowed `#[allow(clippy::too_many_arguments)]` is on
+`get_hybrid_tickers` because skill-trading's source method already
+uses the same allow.
+
 ## Layout
 
 - `swarms-rs/` — upstream library crate. **Don't edit.** Read it to
