@@ -23,6 +23,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
+# Used by both lib (examples) and the mcp bridge binary.
+dotenvy = "0.15"
+
 # skill-trading provides the typed TTC API client. Pinned by rev so
 # a `cargo update` doesn't silently change behavior — bump the rev
 # manually when you want the latest. Switch to `tag = "vX.Y.Z"` once
@@ -34,4 +37,7 @@ swarms-macro = { path = "../swarms-macro" }
 
 [dev-dependencies]
 anyhow = "1"
-dotenvy = "0.15"
+
+[[bin]]
+name = "swarms-tetrac-mcp-bridge"
+path = "src/bin/mcp_bridge.rs"
