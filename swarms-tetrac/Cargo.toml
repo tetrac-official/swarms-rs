@@ -22,9 +22,11 @@ schemars = { version = "0.8", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
 
-# skill-trading provides the typed TTC API client. Path dep for local
-# dev; switch to a git dep once the GitHub mirror is up.
-skill-trading = { path = "../../../rust-cli-ttc-api" }
+# skill-trading provides the typed TTC API client. Pinned by rev so
+# a `cargo update` doesn't silently change behavior — bump the rev
+# manually when you want the latest. Switch to `tag = "vX.Y.Z"` once
+# the upstream tags releases.
+skill-trading = { git = "https://github.com/tetrac-official/rust-cli-ttc-api", rev = "5254618c76db64246cccb8c5cb8b4467178f6296" }
 
 # swarms-macro provides the #[tool] proc macro used in tools.rs.
 swarms-macro = { path = "../swarms-macro" }
