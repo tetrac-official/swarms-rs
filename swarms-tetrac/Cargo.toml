@@ -21,6 +21,7 @@ schemars = { version = "0.8", features = ["derive"] }
 
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 # skill-trading provides the typed TTC API client. Pinned by rev so
 # a `cargo update` doesn't silently change behavior — bump the rev

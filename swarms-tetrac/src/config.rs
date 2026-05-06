@@ -1,7 +1,8 @@
 use std::env;
+use std::fmt;
 use thiserror::Error;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TtcConfig {
     pub auth_token: String,
     pub public_key: String,
@@ -9,6 +10,19 @@ pub struct TtcConfig {
     pub default_exchange: Option<String>,
     pub dry_run: bool,
     pub max_loops_per_minute: u32,
+}
+
+impl fmt::Debug for TtcConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TtcConfig")
+            .field("auth_token", &"[REDACTED]")
+            .field("public_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("default_exchange", &self.default_exchange)
+            .field("dry_run", &self.dry_run)
+            .field("max_loops_per_minute", &self.max_loops_per_minute)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]

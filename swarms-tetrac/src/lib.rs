@@ -6,8 +6,10 @@ mod client;
 pub mod config;
 pub mod error;
 mod parsers;
+pub mod redact;
 pub mod tools;
 
 pub use client::install;
 pub use config::{ConfigError, TtcConfig};
 pub use error::TtcToolError;
+pub use redact::{RedactingFields, init_tracing};
