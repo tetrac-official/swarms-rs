@@ -31,3 +31,7 @@ skill-trading = { git = "https://github.com/tetrac-official/rust-cli-ttc-api", r
 
 # swarms-macro provides the #[tool] proc macro used in tools.rs.
 swarms-macro = { path = "../swarms-macro" }
+
+[dev-dependencies]
+anyhow = "1"
+dotenvy = "0.15"

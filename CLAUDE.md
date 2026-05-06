@@ -28,11 +28,16 @@ Run these in order before merging a feature branch into `main`:
    on our code. Upstream warnings in `swarms-rs/` and `swarms-macro/`
    are pre-existing and ignored; do **not** add `-D warnings` (it
    would fail on those).
-5. **Clean up** before committing: remove dead code, unused imports,
+5. **If the change adds or modifies a runnable example, run it**:
+   `cargo run --example <name> -p swarms-tetrac`. Compilation green
+   is not enough — the example must actually produce sensible output
+   against live services. Skipping this step is how a "one-line fix"
+   ships broken behavior.
+6. **Clean up** before committing: remove dead code, unused imports,
    any debug `dbg!` / `println!`, and unrelated whitespace churn.
-6. Commit with a focused message; squash sibling fixups into the
+7. Commit with a focused message; squash sibling fixups into the
    feature commit before merge if it keeps history readable.
-7. `git checkout main && git merge <branch>` (fast-forward when
+8. `git checkout main && git merge <branch>` (fast-forward when
    possible). Then create the next feature branch off `main`.
 
 If any step fails, fix the underlying cause — don't bypass it with
