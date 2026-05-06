@@ -6,8 +6,12 @@ pub enum TtcToolError {
     NotInstalled,
     #[error("ttc client already installed")]
     AlreadyInstalled,
+    #[error("invalid argument: {0}")]
+    InvalidArg(String),
     #[error(transparent)]
     Api(#[from] skill_trading::TtcError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 #[cfg(test)]

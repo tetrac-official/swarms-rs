@@ -7,7 +7,12 @@ use skill_trading::models::ExchangeCredentials;
 use crate::TtcConfig;
 use crate::error::TtcToolError;
 
-static CLIENT: OnceLock<Client> = OnceLock::new();
+pub(crate) struct TtcRuntime {
+    pub client: Client,
+    pub dry_run: bool,
+}
+
+static RUNTIME: OnceLock<TtcRuntime> = OnceLock::new();
 
 /// Build a TTC API client from `cfg` and store it in the process-wide
 /// `OnceLock`. Subsequent tool calls read from this slot.
@@ -28,13 +33,24 @@ pub fn install(cfg: &TtcConfig) -> Result<(), TtcToolError> {
         ..Default::default()
     };
     let client = Client::new(&app)?;
-    CLIENT
-        .set(client)
+    RUNTIME
+        .set(TtcRuntime {
+            client,
+            dry_run: cfg.dry_run,
+        })
         .map_err(|_| TtcToolError::AlreadyInstalled)
 }
 
+pub(crate) fn runtime() -> Result<&'static TtcRuntime, TtcToolError> {
+    RUNTIME.get().ok_or(TtcToolError::NotInstalled)
+}
+
 pub(crate) fn client() -> Result<&'static Client, TtcToolError> {
-    CLIENT.get().ok_or(TtcToolError::NotInstalled)
+    Ok(&runtime()?.client)
+}
+
+pub(crate) fn dry_run() -> Result<bool, TtcToolError> {
+    Ok(runtime()?.dry_run)
 }
 
 /// Resolve per-exchange credentials by delegating to skill-trading's

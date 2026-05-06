@@ -5,14 +5,33 @@
 //! so an agent already wired to TTC's remote MCP can swap to these
 //! tools by changing only the transport line.
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use skill_trading::models::{
-    Balance, BestBidAsk, FundingRate, GetBestBidAskParams, GetTickersParams, HybridTickersData,
-    OpenInterestItem, Order, Position, ScannerResult, Ticker, VolumeSnapshotExchange,
+    Balance, BestBidAsk, CancelOrderParams, ClosePositionParams, FundingRate, GetBestBidAskParams,
+    GetTickersParams, HybridTickersData, LimitOrderParams, MarketOrderParams, OpenInterestItem,
+    Order, Position, ScannerResult, SetLeverageParams, SetMarginModeParams, StopOrderParams,
+    Ticker, VolumeSnapshotExchange,
 };
 use swarms_macro::tool;
 
-use crate::client::{client, credentials_for};
+use crate::client::{client, credentials_for, dry_run};
 use crate::error::TtcToolError;
+use crate::parsers::{
+    parse_margin_mode, parse_position_side, parse_side, parse_time_in_force, parse_trigger_type,
+};
+
+/// Synthetic JSON envelope returned by mutating tools when
+/// `TTC_DRY_RUN` is true (the default). Lets the LLM see exactly
+/// what would have been sent without us hitting TTC.
+fn dry_run_response(action: &str, args: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "dry_run": true,
+        "action": action,
+        "args": args,
+        "note": "no live call made; set TTC_DRY_RUN=false to enable",
+    })
+}
 
 // ============================================================================
 // /markets/* — credential-free
@@ -194,3 +213,375 @@ async fn get_orders(
         .get_orders(&exchange, symbol.as_deref(), creds)
         .await?)
 }
+
+// ============================================================================
+// Mutating tools — gated by TTC_DRY_RUN (default true)
+// ============================================================================
+
+#[tool(
+    description = "Place a market order on an exchange. Returns a dry-run envelope unless TTC_DRY_RUN=false.",
+    arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
+    arg(symbol, description = "Trading pair, e.g. \"BTC-USDT\".", required = true),
+    arg(side, description = "\"buy\" or \"sell\".", required = true),
+    arg(quantity, description = "Order quantity in base units.", required = true),
+    arg(
+        position_side,
+        description = "\"long\" / \"short\" / \"both\". Required for hedge-mode accounts.",
+        required = false
+    ),
+    arg(reduce_only, description = "If true, only reduces an existing position.", required = false),
+    arg(client_order_id, description = "Caller-supplied order id.", required = false)
+)]
+async fn place_market_order(
+    exchange: String,
+    symbol: String,
+    side: String,
+    quantity: f64,
+    position_side: Option<String>,
+    reduce_only: Option<bool>,
+    client_order_id: Option<String>,
+) -> Result<serde_json::Value, TtcToolError> {
+    let echo = serde_json::json!({
+        "exchange": exchange,
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "position_side": position_side,
+        "reduce_only": reduce_only,
+        "client_order_id": client_order_id,
+    });
+    if dry_run()? {
+        return Ok(dry_run_response("place_market_order", echo));
+    }
+    let creds = credentials_for(&exchange)?;
+    let params = MarketOrderParams {
+        symbol,
+        side: parse_side(&side)?,
+        quantity,
+        position_side: position_side.as_deref().map(parse_position_side).transpose()?,
+        reduce_only,
+        client_order_id,
+    };
+    let order = client()?
+        .place_market_order(&exchange, params, creds)
+        .await?;
+    Ok(serde_json::to_value(order)?)
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PlaceLimitOrderInput {
+    /// Exchange slug, e.g. "orderly".
+    pub exchange: String,
+    /// Trading pair, e.g. "BTC-USDT".
+    pub symbol: String,
+    /// "buy" or "sell".
+    pub side: String,
+    /// Order quantity in base units.
+    pub quantity: f64,
+    /// Limit price.
+    pub price: f64,
+    /// "long" / "short" / "both". Required for hedge-mode accounts.
+    pub position_side: Option<String>,
+    /// "GoodTillCancel" / "ImmediateOrCancel" / "FillOrKill" / "PostOnly" (or GTC/IOC/FOK).
+    pub time_in_force: Option<String>,
+    /// If true, only reduces an existing position.
+    pub reduce_only: Option<bool>,
+    /// Optional take-profit trigger price.
+    pub take_profit_price: Option<f64>,
+    /// Optional stop-loss trigger price.
+    pub stop_loss_price: Option<f64>,
+    /// Caller-supplied order id.
+    pub client_order_id: Option<String>,
+}
+
+#[tool(
+    description = "Place a limit order on an exchange. Returns a dry-run envelope unless TTC_DRY_RUN=false."
+)]
+async fn place_limit_order(args: PlaceLimitOrderInput) -> Result<serde_json::Value, TtcToolError> {
+    let echo = serde_json::to_value(&args)?;
+    if dry_run()? {
+        return Ok(dry_run_response("place_limit_order", echo));
+    }
+    let creds = credentials_for(&args.exchange)?;
+    let params = LimitOrderParams {
+        symbol: args.symbol,
+        side: parse_side(&args.side)?,
+        quantity: args.quantity,
+        price: args.price,
+        position_side: args
+            .position_side
+            .as_deref()
+            .map(parse_position_side)
+            .transpose()?,
+        time_in_force: args
+            .time_in_force
+            .as_deref()
+            .map(parse_time_in_force)
+            .transpose()?,
+        reduce_only: args.reduce_only,
+        take_profit_price: args.take_profit_price,
+        stop_loss_price: args.stop_loss_price,
+        client_order_id: args.client_order_id,
+    };
+    let order = client()?
+        .place_limit_order(&args.exchange, params, creds)
+        .await?;
+    Ok(serde_json::to_value(order)?)
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PlaceStopOrderInput {
+    /// Exchange slug, e.g. "orderly".
+    pub exchange: String,
+    /// Trading pair, e.g. "BTC-USDT".
+    pub symbol: String,
+    /// "buy" or "sell".
+    pub side: String,
+    /// Order quantity in base units.
+    pub quantity: f64,
+    /// Stop trigger price.
+    pub stop_price: f64,
+    /// "long" / "short" / "both". Required for hedge-mode accounts.
+    pub position_side: Option<String>,
+    /// "ByLastPrice" / "ByMarkPrice" / "ByIndexPrice" (or last/mark/index).
+    pub trigger_type: Option<String>,
+    /// Limit price (turns this into a stop-limit). Omit for stop-market.
+    pub price: Option<f64>,
+    /// Close-position flag (some exchanges).
+    pub close_position: Option<bool>,
+    pub reduce_only: Option<bool>,
+    pub client_order_id: Option<String>,
+}
+
+#[tool(
+    description = "Place a stop order on an exchange. Returns a dry-run envelope unless TTC_DRY_RUN=false."
+)]
+async fn place_stop_order(args: PlaceStopOrderInput) -> Result<serde_json::Value, TtcToolError> {
+    let echo = serde_json::to_value(&args)?;
+    if dry_run()? {
+        return Ok(dry_run_response("place_stop_order", echo));
+    }
+    let creds = credentials_for(&args.exchange)?;
+    let params = StopOrderParams {
+        symbol: args.symbol,
+        side: parse_side(&args.side)?,
+        quantity: args.quantity,
+        stop_price: args.stop_price,
+        position_side: args
+            .position_side
+            .as_deref()
+            .map(parse_position_side)
+            .transpose()?,
+        trigger_type: args
+            .trigger_type
+            .as_deref()
+            .map(parse_trigger_type)
+            .transpose()?,
+        price: args.price,
+        close_position: args.close_position,
+        reduce_only: args.reduce_only,
+        client_order_id: args.client_order_id,
+    };
+    let order = client()?
+        .place_stop_order(&args.exchange, params, creds)
+        .await?;
+    Ok(serde_json::to_value(order)?)
+}
+
+#[tool(
+    description = "Cancel a specific order. Returns a dry-run envelope unless TTC_DRY_RUN=false.",
+    arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
+    arg(symbol, description = "Trading pair, e.g. \"BTC-USDT\".", required = true),
+    arg(order_id, description = "Order id to cancel.", required = false),
+    arg(client_order_id, description = "Client-set order id to cancel.", required = false)
+)]
+async fn cancel_order(
+    exchange: String,
+    symbol: String,
+    order_id: Option<String>,
+    client_order_id: Option<String>,
+) -> Result<serde_json::Value, TtcToolError> {
+    let echo = serde_json::json!({
+        "exchange": exchange,
+        "symbol": symbol,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+    });
+    if dry_run()? {
+        return Ok(dry_run_response("cancel_order", echo));
+    }
+    let creds = credentials_for(&exchange)?;
+    let params = CancelOrderParams {
+        symbol,
+        order_id,
+        client_order_id,
+    };
+    let cancelled = client()?.cancel_order(&exchange, params, creds).await?;
+    Ok(serde_json::json!({ "cancelled": cancelled }))
+}
+
+#[tool(
+    description = "Cancel all open orders on an exchange, optionally scoped to a symbol. Returns a dry-run envelope unless TTC_DRY_RUN=false.",
+    arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
+    arg(symbol, description = "Optional symbol scope, e.g. \"BTC-USDT\".", required = false)
+)]
+async fn cancel_all_orders(
+    exchange: String,
+    symbol: Option<String>,
+) -> Result<serde_json::Value, TtcToolError> {
+    let echo = serde_json::json!({ "exchange": exchange, "symbol": symbol });
+    if dry_run()? {
+        return Ok(dry_run_response("cancel_all_orders", echo));
+    }
+    let creds = credentials_for(&exchange)?;
+    let result = client()?
+        .cancel_all_orders(&exchange, symbol.as_deref(), creds)
+        .await?;
+    Ok(serde_json::to_value(result)?)
+}
+
+#[tool(
+    description = "Close an open position on an exchange (full or partial). Returns a dry-run envelope unless TTC_DRY_RUN=false.",
+    arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
+    arg(symbol, description = "Trading pair to close, e.g. \"BTC-USDT\".", required = true),
+    arg(
+        position_side,
+        description = "\"long\" / \"short\" / \"both\". Required for hedge-mode accounts.",
+        required = false
+    ),
+    arg(quantity, description = "Partial-close quantity. Omit to close fully.", required = false)
+)]
+async fn close_position(
+    exchange: String,
+    symbol: String,
+    position_side: Option<String>,
+    quantity: Option<f64>,
+) -> Result<serde_json::Value, TtcToolError> {
+    let echo = serde_json::json!({
+        "exchange": exchange,
+        "symbol": symbol,
+        "position_side": position_side,
+        "quantity": quantity,
+    });
+    if dry_run()? {
+        return Ok(dry_run_response("close_position", echo));
+    }
+    let creds = credentials_for(&exchange)?;
+    let params = ClosePositionParams {
+        symbol,
+        position_side: position_side.as_deref().map(parse_position_side).transpose()?,
+        quantity,
+    };
+    let order = client()?.close_position(&exchange, params, creds).await?;
+    Ok(serde_json::to_value(order)?)
+}
+
+#[tool(
+    description = "Set leverage for a symbol on an exchange. Returns a dry-run envelope unless TTC_DRY_RUN=false.",
+    arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
+    arg(symbol, description = "Trading pair, e.g. \"BTC-USDT\".", required = true),
+    arg(leverage, description = "Leverage multiplier, e.g. 10.", required = true)
+)]
+async fn set_leverage(
+    exchange: String,
+    symbol: String,
+    leverage: u32,
+) -> Result<serde_json::Value, TtcToolError> {
+    let echo = serde_json::json!({
+        "exchange": exchange,
+        "symbol": symbol,
+        "leverage": leverage,
+    });
+    if dry_run()? {
+        return Ok(dry_run_response("set_leverage", echo));
+    }
+    let creds = credentials_for(&exchange)?;
+    let params = SetLeverageParams { symbol, leverage };
+    let result = client()?.set_leverage(&exchange, params, creds).await?;
+    Ok(serde_json::to_value(result)?)
+}
+
+#[tool(
+    description = "Set margin mode (isolated/cross). Returns a dry-run envelope unless TTC_DRY_RUN=false.",
+    arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
+    arg(margin_mode, description = "\"isolated\" or \"cross\".", required = true),
+    arg(
+        symbol,
+        description = "Optional symbol scope (some exchanges set margin mode per-symbol).",
+        required = false
+    )
+)]
+async fn set_margin_mode(
+    exchange: String,
+    margin_mode: String,
+    symbol: Option<String>,
+) -> Result<serde_json::Value, TtcToolError> {
+    let echo = serde_json::json!({
+        "exchange": exchange,
+        "margin_mode": margin_mode,
+        "symbol": symbol,
+    });
+    if dry_run()? {
+        return Ok(dry_run_response("set_margin_mode", echo));
+    }
+    let creds = credentials_for(&exchange)?;
+    let params = SetMarginModeParams {
+        symbol,
+        margin_mode: parse_margin_mode(&margin_mode)?,
+    };
+    let result = client()?.set_margin_mode(&exchange, params, creds).await?;
+    Ok(serde_json::to_value(result)?)
+}
+
+#[tool(
+    description = "Toggle hedge mode (one-way vs two-way positions). Returns a dry-run envelope unless TTC_DRY_RUN=false.",
+    arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
+    arg(enabled, description = "true = hedge mode, false = one-way.", required = true)
+)]
+async fn set_hedge_mode(
+    exchange: String,
+    enabled: bool,
+) -> Result<serde_json::Value, TtcToolError> {
+    let echo = serde_json::json!({ "exchange": exchange, "enabled": enabled });
+    if dry_run()? {
+        return Ok(dry_run_response("set_hedge_mode", echo));
+    }
+    let creds = credentials_for(&exchange)?;
+    let result = client()?.set_hedge_mode(&exchange, enabled, creds).await?;
+    Ok(serde_json::to_value(result)?)
+}
+
+// ============================================================================
+// Tests for pure-logic helpers (dry_run_response shape).
+// Live + dry_run install paths are covered by D9 (mockito).
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dry_run_response_carries_action_and_args() {
+        let v = dry_run_response("place_market_order", serde_json::json!({"x": 1}));
+        assert_eq!(v["dry_run"], true);
+        assert_eq!(v["action"], "place_market_order");
+        assert_eq!(v["args"]["x"], 1);
+        assert!(
+            v["note"].as_str().unwrap().contains("TTC_DRY_RUN"),
+            "note must point at the env var the user flips"
+        );
+    }
+
+    #[test]
+    fn dry_run_response_args_passthrough_is_lossless() {
+        let original = serde_json::json!({
+            "exchange": "orderly",
+            "symbol": "BTC-USDT",
+            "side": "buy",
+            "quantity": 0.001,
+        });
+        let v = dry_run_response("place_market_order", original.clone());
+        assert_eq!(v["args"], original);
+    }
+}
+
