@@ -4,8 +4,6 @@ use thiserror::Error;
 pub enum TtcToolError {
     #[error("ttc client not installed; call swarms_tetrac::install() first")]
     NotInstalled,
-    #[error("ttc client already installed")]
-    AlreadyInstalled,
     #[error("invalid argument: {0}")]
     InvalidArg(String),
     #[error(transparent)]
@@ -22,12 +20,6 @@ mod tests {
     fn not_installed_message_points_to_install_fn() {
         let s = TtcToolError::NotInstalled.to_string();
         assert!(s.contains("install"), "got: {s}");
-    }
-
-    #[test]
-    fn already_installed_message_is_descriptive() {
-        let s = TtcToolError::AlreadyInstalled.to_string();
-        assert!(s.contains("already"), "got: {s}");
     }
 
     #[test]

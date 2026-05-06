@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use skill_trading::api::Client;
 use skill_trading::config::AppConfig;
@@ -12,16 +12,12 @@ pub(crate) struct TtcRuntime {
     pub dry_run: bool,
 }
 
-static RUNTIME: OnceLock<TtcRuntime> = OnceLock::new();
+/// `OnceLock` seeds the slot lazily; `RwLock` lets `install()` swap the
+/// inner `Arc` after auth refresh without invalidating in-flight calls.
+/// Each tool fn takes a cheap `Arc` snapshot at the start of its body.
+static SLOT: OnceLock<RwLock<Arc<TtcRuntime>>> = OnceLock::new();
 
-/// Build a TTC API client from `cfg` and store it in the process-wide
-/// `OnceLock`. Subsequent tool calls read from this slot.
-///
-/// Returns `AlreadyInstalled` if called twice. Re-installing would
-/// silently change the client every active tool sees, which is the
-/// kind of surprise that turns into a debugging nightmare; force the
-/// caller to be explicit instead.
-pub fn install(cfg: &TtcConfig) -> Result<(), TtcToolError> {
+fn build_runtime(cfg: &TtcConfig) -> Result<TtcRuntime, TtcToolError> {
     let api = skill_trading::config::ApiConfig {
         base_url: cfg.base_url.clone(),
         ..Default::default()
@@ -33,20 +29,35 @@ pub fn install(cfg: &TtcConfig) -> Result<(), TtcToolError> {
         ..Default::default()
     };
     let client = Client::new(&app)?;
-    RUNTIME
-        .set(TtcRuntime {
-            client,
-            dry_run: cfg.dry_run,
-        })
-        .map_err(|_| TtcToolError::AlreadyInstalled)
+    Ok(TtcRuntime {
+        client,
+        dry_run: cfg.dry_run,
+    })
 }
 
-pub(crate) fn runtime() -> Result<&'static TtcRuntime, TtcToolError> {
-    RUNTIME.get().ok_or(TtcToolError::NotInstalled)
+/// Install or replace the process-wide TTC runtime.
+///
+/// Idempotent: a second call swaps the inner `Arc` atomically. Pre-existing
+/// tool calls that already took an `Arc` snapshot keep using the old client
+/// until they finish; new calls see the new one. This is what makes auth
+/// refresh possible without restarting the process.
+pub fn install(cfg: &TtcConfig) -> Result<(), TtcToolError> {
+    let new_runtime = Arc::new(build_runtime(cfg)?);
+    if let Some(slot) = SLOT.get() {
+        *slot.write().expect("runtime lock poisoned") = new_runtime;
+        return Ok(());
+    }
+    // First install. If a parallel call beats us, fall through to swap.
+    if SLOT.set(RwLock::new(new_runtime.clone())).is_err() {
+        let slot = SLOT.get().expect("set failed but slot must exist");
+        *slot.write().expect("runtime lock poisoned") = new_runtime;
+    }
+    Ok(())
 }
 
-pub(crate) fn client() -> Result<&'static Client, TtcToolError> {
-    Ok(&runtime()?.client)
+pub(crate) fn runtime() -> Result<Arc<TtcRuntime>, TtcToolError> {
+    let slot = SLOT.get().ok_or(TtcToolError::NotInstalled)?;
+    Ok(slot.read().expect("runtime lock poisoned").clone())
 }
 
 pub(crate) fn dry_run() -> Result<bool, TtcToolError> {
@@ -71,14 +82,12 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// `install()` is intentionally not exercised here — the OnceLock
-    /// is process-global and a successful install would poison every
-    /// other test in this module. Integration coverage of install
-    /// belongs under D9 (mockito-backed).
+    /// `install()` is intentionally not exercised here — the OnceLock-backed
+    /// SLOT is process-global. Integration coverage lives under D9 (mockito).
     #[test]
-    fn client_errors_with_not_installed_before_install() {
-        match client() {
-            Ok(_) => panic!("client should be empty in unit tests; install() must not be called here"),
+    fn runtime_errors_with_not_installed_before_install() {
+        match runtime() {
+            Ok(_) => panic!("runtime should be empty in unit tests; install() must not be called here"),
             Err(e) => assert!(matches!(e, TtcToolError::NotInstalled)),
         }
     }
@@ -86,8 +95,6 @@ mod tests {
     #[test]
     fn credentials_for_missing_env_returns_api_error() {
         let _g = ENV_LOCK.lock().unwrap();
-        // Make sure neither the per-exchange slot nor the global
-        // override is set in this test's process env.
         // SAFETY: serialized via ENV_LOCK.
         unsafe {
             std::env::remove_var("ZZZTEST_API_KEY");
@@ -115,7 +122,6 @@ mod tests {
         assert_eq!(creds.api_key, "k");
         assert_eq!(creds.api_secret, "s");
         assert!(creds.passphrase.is_none());
-        // Cleanup so the next test sees a clean slate.
         unsafe {
             std::env::remove_var("ZZZTEST_API_KEY");
             std::env::remove_var("ZZZTEST_API_SECRET");
