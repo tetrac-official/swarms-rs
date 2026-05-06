@@ -20,6 +20,7 @@ use crate::error::TtcToolError;
 use crate::parsers::{
     parse_margin_mode, parse_position_side, parse_side, parse_time_in_force, parse_trigger_type,
 };
+use crate::runtime::with_auth_refresh;
 
 /// Synthetic JSON envelope returned by mutating tools when
 /// `TTC_DRY_RUN` is true (the default). Lets the LLM see exactly
@@ -67,18 +68,22 @@ async fn get_hybrid_tickers(
     up: Option<f64>,
     down: Option<f64>,
 ) -> Result<HybridTickersData, TtcToolError> {
-    Ok(runtime()?.client
-        .get_hybrid_tickers(
-            market_type.as_deref(),
-            exchange.as_deref(),
-            symbol.as_deref(),
-            min_volume,
-            min_price,
-            max_price,
-            up,
-            down,
-        )
-        .await?)
+    with_auth_refresh(|| async {
+        Ok(runtime()?
+            .client
+            .get_hybrid_tickers(
+                market_type.as_deref(),
+                exchange.as_deref(),
+                symbol.as_deref(),
+                min_volume,
+                min_price,
+                max_price,
+                up,
+                down,
+            )
+            .await?)
+    })
+    .await
 }
 
 #[tool(
@@ -90,7 +95,13 @@ async fn get_hybrid_tickers(
     )
 )]
 async fn get_funding_rates(symbol: Option<String>) -> Result<Vec<FundingRate>, TtcToolError> {
-    Ok(runtime()?.client.get_funding_rates(symbol.as_deref()).await?)
+    with_auth_refresh(|| async {
+        Ok(runtime()?
+            .client
+            .get_funding_rates(symbol.as_deref())
+            .await?)
+    })
+    .await
 }
 
 #[tool(
@@ -102,12 +113,18 @@ async fn get_funding_rates(symbol: Option<String>) -> Result<Vec<FundingRate>, T
     )
 )]
 async fn get_open_interest(symbol: Option<String>) -> Result<Vec<OpenInterestItem>, TtcToolError> {
-    Ok(runtime()?.client.get_open_interest(symbol.as_deref()).await?)
+    with_auth_refresh(|| async {
+        Ok(runtime()?
+            .client
+            .get_open_interest(symbol.as_deref())
+            .await?)
+    })
+    .await
 }
 
 #[tool(description = "Volume snapshot across exchanges (24h volume, OI, TVL, per-market breakdown).")]
 async fn get_volume_snapshot() -> Result<Vec<VolumeSnapshotExchange>, TtcToolError> {
-    Ok(runtime()?.client.get_volume_snapshot().await?)
+    with_auth_refresh(|| async { Ok(runtime()?.client.get_volume_snapshot().await?) }).await
 }
 
 #[tool(
@@ -127,9 +144,13 @@ async fn get_scanner(
     bars: Option<u32>,
     swing_strength: Option<u32>,
 ) -> Result<ScannerResult, TtcToolError> {
-    Ok(runtime()?.client
-        .get_scanner(&symbol, timeframe.as_deref(), bars, swing_strength)
-        .await?)
+    with_auth_refresh(|| async {
+        Ok(runtime()?
+            .client
+            .get_scanner(&symbol, timeframe.as_deref(), bars, swing_strength)
+            .await?)
+    })
+    .await
 }
 
 // ============================================================================
@@ -149,9 +170,17 @@ async fn get_tickers(
     exchange: String,
     symbol: Option<String>,
 ) -> Result<Vec<Ticker>, TtcToolError> {
-    let creds = credentials_for(&exchange)?;
-    let params = GetTickersParams { symbol };
-    Ok(runtime()?.client.get_tickers(&exchange, params, creds).await?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let params = GetTickersParams {
+            symbol: symbol.clone(),
+        };
+        Ok(runtime()?
+            .client
+            .get_tickers(&exchange, params, creds)
+            .await?)
+    })
+    .await
 }
 
 #[tool(
@@ -160,11 +189,17 @@ async fn get_tickers(
     arg(symbol, description = "Trading pair, e.g. \"BTC-USDT\".", required = true)
 )]
 async fn get_best_bid_ask(exchange: String, symbol: String) -> Result<BestBidAsk, TtcToolError> {
-    let creds = credentials_for(&exchange)?;
-    let params = GetBestBidAskParams { symbol };
-    Ok(runtime()?.client
-        .get_best_bid_ask(&exchange, params, creds)
-        .await?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let params = GetBestBidAskParams {
+            symbol: symbol.clone(),
+        };
+        Ok(runtime()?
+            .client
+            .get_best_bid_ask(&exchange, params, creds)
+            .await?)
+    })
+    .await
 }
 
 #[tool(
@@ -180,10 +215,14 @@ async fn get_positions(
     exchange: String,
     symbol: Option<String>,
 ) -> Result<Vec<Position>, TtcToolError> {
-    let creds = credentials_for(&exchange)?;
-    Ok(runtime()?.client
-        .get_positions(&exchange, symbol.as_deref(), creds)
-        .await?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        Ok(runtime()?
+            .client
+            .get_positions(&exchange, symbol.as_deref(), creds)
+            .await?)
+    })
+    .await
 }
 
 #[tool(
@@ -191,8 +230,11 @@ async fn get_positions(
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true)
 )]
 async fn get_balance(exchange: String) -> Result<Vec<Balance>, TtcToolError> {
-    let creds = credentials_for(&exchange)?;
-    Ok(runtime()?.client.get_balance(&exchange, creds).await?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        Ok(runtime()?.client.get_balance(&exchange, creds).await?)
+    })
+    .await
 }
 
 #[tool(
@@ -208,10 +250,14 @@ async fn get_orders(
     exchange: String,
     symbol: Option<String>,
 ) -> Result<Vec<Order>, TtcToolError> {
-    let creds = credentials_for(&exchange)?;
-    Ok(runtime()?.client
-        .get_orders(&exchange, symbol.as_deref(), creds)
-        .await?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        Ok(runtime()?
+            .client
+            .get_orders(&exchange, symbol.as_deref(), creds)
+            .await?)
+    })
+    .await
 }
 
 // ============================================================================
@@ -253,19 +299,26 @@ async fn place_market_order(
     if dry_run()? {
         return Ok(dry_run_response("place_market_order", echo));
     }
-    let creds = credentials_for(&exchange)?;
-    let params = MarketOrderParams {
-        symbol,
-        side: parse_side(&side)?,
-        quantity,
-        position_side: position_side.as_deref().map(parse_position_side).transpose()?,
-        reduce_only,
-        client_order_id,
-    };
-    let order = runtime()?.client
-        .place_market_order(&exchange, params, creds)
-        .await?;
-    Ok(serde_json::to_value(order)?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let params = MarketOrderParams {
+            symbol: symbol.clone(),
+            side: parse_side(&side)?,
+            quantity,
+            position_side: position_side
+                .as_deref()
+                .map(parse_position_side)
+                .transpose()?,
+            reduce_only,
+            client_order_id: client_order_id.clone(),
+        };
+        let order = runtime()?
+            .client
+            .place_market_order(&exchange, params, creds)
+            .await?;
+        Ok(serde_json::to_value(order)?)
+    })
+    .await
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -302,31 +355,35 @@ async fn place_limit_order(args: PlaceLimitOrderInput) -> Result<serde_json::Val
     if dry_run()? {
         return Ok(dry_run_response("place_limit_order", echo));
     }
-    let creds = credentials_for(&args.exchange)?;
-    let params = LimitOrderParams {
-        symbol: args.symbol,
-        side: parse_side(&args.side)?,
-        quantity: args.quantity,
-        price: args.price,
-        position_side: args
-            .position_side
-            .as_deref()
-            .map(parse_position_side)
-            .transpose()?,
-        time_in_force: args
-            .time_in_force
-            .as_deref()
-            .map(parse_time_in_force)
-            .transpose()?,
-        reduce_only: args.reduce_only,
-        take_profit_price: args.take_profit_price,
-        stop_loss_price: args.stop_loss_price,
-        client_order_id: args.client_order_id,
-    };
-    let order = runtime()?.client
-        .place_limit_order(&args.exchange, params, creds)
-        .await?;
-    Ok(serde_json::to_value(order)?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&args.exchange)?;
+        let params = LimitOrderParams {
+            symbol: args.symbol.clone(),
+            side: parse_side(&args.side)?,
+            quantity: args.quantity,
+            price: args.price,
+            position_side: args
+                .position_side
+                .as_deref()
+                .map(parse_position_side)
+                .transpose()?,
+            time_in_force: args
+                .time_in_force
+                .as_deref()
+                .map(parse_time_in_force)
+                .transpose()?,
+            reduce_only: args.reduce_only,
+            take_profit_price: args.take_profit_price,
+            stop_loss_price: args.stop_loss_price,
+            client_order_id: args.client_order_id.clone(),
+        };
+        let order = runtime()?
+            .client
+            .place_limit_order(&args.exchange, params, creds)
+            .await?;
+        Ok(serde_json::to_value(order)?)
+    })
+    .await
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -361,31 +418,35 @@ async fn place_stop_order(args: PlaceStopOrderInput) -> Result<serde_json::Value
     if dry_run()? {
         return Ok(dry_run_response("place_stop_order", echo));
     }
-    let creds = credentials_for(&args.exchange)?;
-    let params = StopOrderParams {
-        symbol: args.symbol,
-        side: parse_side(&args.side)?,
-        quantity: args.quantity,
-        stop_price: args.stop_price,
-        position_side: args
-            .position_side
-            .as_deref()
-            .map(parse_position_side)
-            .transpose()?,
-        trigger_type: args
-            .trigger_type
-            .as_deref()
-            .map(parse_trigger_type)
-            .transpose()?,
-        price: args.price,
-        close_position: args.close_position,
-        reduce_only: args.reduce_only,
-        client_order_id: args.client_order_id,
-    };
-    let order = runtime()?.client
-        .place_stop_order(&args.exchange, params, creds)
-        .await?;
-    Ok(serde_json::to_value(order)?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&args.exchange)?;
+        let params = StopOrderParams {
+            symbol: args.symbol.clone(),
+            side: parse_side(&args.side)?,
+            quantity: args.quantity,
+            stop_price: args.stop_price,
+            position_side: args
+                .position_side
+                .as_deref()
+                .map(parse_position_side)
+                .transpose()?,
+            trigger_type: args
+                .trigger_type
+                .as_deref()
+                .map(parse_trigger_type)
+                .transpose()?,
+            price: args.price,
+            close_position: args.close_position,
+            reduce_only: args.reduce_only,
+            client_order_id: args.client_order_id.clone(),
+        };
+        let order = runtime()?
+            .client
+            .place_stop_order(&args.exchange, params, creds)
+            .await?;
+        Ok(serde_json::to_value(order)?)
+    })
+    .await
 }
 
 #[tool(
@@ -410,14 +471,20 @@ async fn cancel_order(
     if dry_run()? {
         return Ok(dry_run_response("cancel_order", echo));
     }
-    let creds = credentials_for(&exchange)?;
-    let params = CancelOrderParams {
-        symbol,
-        order_id,
-        client_order_id,
-    };
-    let cancelled = runtime()?.client.cancel_order(&exchange, params, creds).await?;
-    Ok(serde_json::json!({ "cancelled": cancelled }))
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let params = CancelOrderParams {
+            symbol: symbol.clone(),
+            order_id: order_id.clone(),
+            client_order_id: client_order_id.clone(),
+        };
+        let cancelled = runtime()?
+            .client
+            .cancel_order(&exchange, params, creds)
+            .await?;
+        Ok(serde_json::json!({ "cancelled": cancelled }))
+    })
+    .await
 }
 
 #[tool(
@@ -433,11 +500,15 @@ async fn cancel_all_orders(
     if dry_run()? {
         return Ok(dry_run_response("cancel_all_orders", echo));
     }
-    let creds = credentials_for(&exchange)?;
-    let result = runtime()?.client
-        .cancel_all_orders(&exchange, symbol.as_deref(), creds)
-        .await?;
-    Ok(serde_json::to_value(result)?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let result = runtime()?
+            .client
+            .cancel_all_orders(&exchange, symbol.as_deref(), creds)
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    })
+    .await
 }
 
 #[tool(
@@ -466,14 +537,23 @@ async fn close_position(
     if dry_run()? {
         return Ok(dry_run_response("close_position", echo));
     }
-    let creds = credentials_for(&exchange)?;
-    let params = ClosePositionParams {
-        symbol,
-        position_side: position_side.as_deref().map(parse_position_side).transpose()?,
-        quantity,
-    };
-    let order = runtime()?.client.close_position(&exchange, params, creds).await?;
-    Ok(serde_json::to_value(order)?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let params = ClosePositionParams {
+            symbol: symbol.clone(),
+            position_side: position_side
+                .as_deref()
+                .map(parse_position_side)
+                .transpose()?,
+            quantity,
+        };
+        let order = runtime()?
+            .client
+            .close_position(&exchange, params, creds)
+            .await?;
+        Ok(serde_json::to_value(order)?)
+    })
+    .await
 }
 
 #[tool(
@@ -495,10 +575,19 @@ async fn set_leverage(
     if dry_run()? {
         return Ok(dry_run_response("set_leverage", echo));
     }
-    let creds = credentials_for(&exchange)?;
-    let params = SetLeverageParams { symbol, leverage };
-    let result = runtime()?.client.set_leverage(&exchange, params, creds).await?;
-    Ok(serde_json::to_value(result)?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let params = SetLeverageParams {
+            symbol: symbol.clone(),
+            leverage,
+        };
+        let result = runtime()?
+            .client
+            .set_leverage(&exchange, params, creds)
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    })
+    .await
 }
 
 #[tool(
@@ -524,13 +613,19 @@ async fn set_margin_mode(
     if dry_run()? {
         return Ok(dry_run_response("set_margin_mode", echo));
     }
-    let creds = credentials_for(&exchange)?;
-    let params = SetMarginModeParams {
-        symbol,
-        margin_mode: parse_margin_mode(&margin_mode)?,
-    };
-    let result = runtime()?.client.set_margin_mode(&exchange, params, creds).await?;
-    Ok(serde_json::to_value(result)?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let params = SetMarginModeParams {
+            symbol: symbol.clone(),
+            margin_mode: parse_margin_mode(&margin_mode)?,
+        };
+        let result = runtime()?
+            .client
+            .set_margin_mode(&exchange, params, creds)
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    })
+    .await
 }
 
 #[tool(
@@ -546,9 +641,15 @@ async fn set_hedge_mode(
     if dry_run()? {
         return Ok(dry_run_response("set_hedge_mode", echo));
     }
-    let creds = credentials_for(&exchange)?;
-    let result = runtime()?.client.set_hedge_mode(&exchange, enabled, creds).await?;
-    Ok(serde_json::to_value(result)?)
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let result = runtime()?
+            .client
+            .set_hedge_mode(&exchange, enabled, creds)
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    })
+    .await
 }
 
 // ============================================================================

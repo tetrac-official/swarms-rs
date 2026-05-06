@@ -14,4 +14,7 @@ pub use client::install;
 pub use config::{ConfigError, TtcConfig};
 pub use error::TtcToolError;
 pub use redact::{RedactingFields, init_tracing};
-pub use runtime::{LoopRunner, refresh_auth, with_auth_refresh, with_retry_on_auth};
+pub use runtime::{
+    LoopRunner, refresh_auth, refresh_if_stale, token_age_if_stale, with_auth_refresh,
+    with_retry_on_auth,
+};

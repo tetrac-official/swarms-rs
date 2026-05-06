@@ -5,7 +5,7 @@
 //! interval` in `swarms_agent.rs`). This module fills that gap.
 
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::process::Command;
 use tokio::signal;
@@ -171,6 +171,37 @@ where
     with_retry_on_auth(f, refresh_auth).await
 }
 
+/// Read `TTC_TOKEN_ISSUED_AT` (unix seconds, written by `skill-trading
+/// register/login`); if the token is older than `max_age`, run
+/// [`refresh_auth`]. Returns `Ok(true)` if a refresh fired.
+///
+/// No-op (returns `Ok(false)`) when the env var is missing or unparseable —
+/// we don't want a missing var to subprocess `skill-trading login` on every
+/// tick. Pair this with [`with_auth_refresh`] for belt-and-suspenders: the
+/// timer keeps the token fresh proactively, the wrapper handles the rare
+/// case where the timer was wrong (clock skew, server-side revocation).
+/// Pure helper: returns `Some(age_secs)` when the token's age exceeds
+/// `max_age`. `None` if the env var is missing/unparseable, the token is
+/// fresh, or the system clock is broken. Doesn't subprocess anything.
+pub fn token_age_if_stale(max_age: Duration) -> Option<u64> {
+    let issued_at: u64 = env::var("TTC_TOKEN_ISSUED_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let age = now.saturating_sub(issued_at);
+    (age >= max_age.as_secs()).then_some(age)
+}
+
+pub async fn refresh_if_stale(max_age: Duration) -> Result<bool, TtcToolError> {
+    if let Some(age) = token_age_if_stale(max_age) {
+        tracing::info!(age_secs = age, "token stale; refreshing");
+        refresh_auth().await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +305,48 @@ mod tests {
         assert_eq!(attempt.load(Ordering::SeqCst), 2, "f called twice");
         assert_eq!(refresh_called.load(Ordering::SeqCst), 1, "refresh called once");
     }
+
+    #[test]
+    fn token_age_if_stale_returns_age_when_old() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var("TTC_TOKEN_ISSUED_AT", (now - 100_000).to_string());
+        }
+        let result = token_age_if_stale(Duration::from_secs(60_000));
+        assert!(matches!(result, Some(age) if age >= 100_000));
+        unsafe { std::env::remove_var("TTC_TOKEN_ISSUED_AT") };
+    }
+
+    #[test]
+    fn token_age_if_stale_returns_none_when_fresh() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        unsafe {
+            std::env::set_var("TTC_TOKEN_ISSUED_AT", (now - 60).to_string());
+        }
+        let result = token_age_if_stale(Duration::from_secs(3600));
+        assert!(result.is_none());
+        unsafe { std::env::remove_var("TTC_TOKEN_ISSUED_AT") };
+    }
+
+    #[test]
+    fn token_age_if_stale_handles_missing_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("TTC_TOKEN_ISSUED_AT") };
+        assert!(token_age_if_stale(Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn token_age_if_stale_handles_garbage() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("TTC_TOKEN_ISSUED_AT", "not-a-number") };
+        assert!(token_age_if_stale(Duration::from_secs(1)).is_none());
+        unsafe { std::env::remove_var("TTC_TOKEN_ISSUED_AT") };
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[tokio::test]
     async fn with_retry_on_auth_does_not_refresh_for_non_auth_errors() {

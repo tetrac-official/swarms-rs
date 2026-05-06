@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use swarms_rs::llm::provider::openai::OpenAI;
 use swarms_rs::structs::agent::Agent;
 use swarms_tetrac::tools::{GetFundingRatesTool, GetScannerTool};
-use swarms_tetrac::{LoopRunner, TtcConfig, with_auth_refresh};
+use swarms_tetrac::{LoopRunner, TtcConfig, refresh_if_stale, with_auth_refresh};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -71,10 +71,18 @@ async fn main() -> Result<()> {
     let runner = LoopRunner::every(Duration::from_secs(interval_secs))
         .max_ticks(if max_ticks == 0 { u64::MAX } else { max_ticks });
 
+    // Proactive auth refresh: any token older than 23h gets refreshed at the
+    // start of the cycle, before we even talk to the LLM. Belt; the per-tool
+    // `with_auth_refresh` is the suspenders for clock skew / unexpected 401s.
+    let max_token_age = Duration::from_secs(23 * 3600);
+
     runner
         .run(|cycle| {
             let agent = &agent;
             async move {
+                if let Err(e) = refresh_if_stale(max_token_age).await {
+                    tracing::warn!(error = %e, "proactive refresh failed; continuing with current token");
+                }
                 let prompt = format!(
                     "Run a fresh scan for cycle {cycle}. Use the prescribed format."
                 );
