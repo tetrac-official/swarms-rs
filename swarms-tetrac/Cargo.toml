@@ -37,6 +37,7 @@ swarms-macro = { path = "../swarms-macro" }
 
 [dev-dependencies]
 anyhow = "1"
+mockito = "1"
 
 [[bin]]
 name = "swarms-tetrac-mcp-bridge"
