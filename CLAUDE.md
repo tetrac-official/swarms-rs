@@ -79,3 +79,17 @@ upstream lifetime style nits. Ignore.
 - No emoji unless explicitly asked.
 - `dry_run: true` is the default for any tool that places, cancels,
   or modifies orders. Flip via `TTC_DRY_RUN=false`.
+
+## Commit messages
+
+- Subject line ≤72 chars. One line.
+- Skip the body. Only add one if there's a non-obvious *why* a
+  reader can't see in the diff (e.g. workaround for a specific bug,
+  a deliberate trade-off). One sentence max.
+- No bullet-point feature lists, no "what changed" recaps — that's
+  what the diff is for.
+
+## Env file
+
+- One template only: `.env.example` (gitignored sibling: `.env`).
+- Don't ship a `.env.sample` alongside it.
