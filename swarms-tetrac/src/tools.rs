@@ -37,6 +37,7 @@ use crate::error::TtcToolError;
     arg(up, description = "Minimum % price change up.", required = false),
     arg(down, description = "Minimum % price change down.", required = false)
 )]
+#[allow(clippy::too_many_arguments)]
 async fn get_hybrid_tickers(
     market_type: Option<String>,
     exchange: Option<String>,
