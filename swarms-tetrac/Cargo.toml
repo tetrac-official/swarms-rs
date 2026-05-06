@@ -22,6 +22,9 @@ schemars = { version = "0.8", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
 
-# skill-trading client lands in D3; left out of D2 so the scaffold
-# compiles without the sibling repo present.
-# skill-trading = { path = "../../rust-cli-ttc-api" }
+# skill-trading provides the typed TTC API client. Path dep for local
+# dev; switch to a git dep once the GitHub mirror is up.
+skill-trading = { path = "../../../rust-cli-ttc-api" }
+
+# swarms-macro provides the #[tool] proc macro used in tools.rs.
+swarms-macro = { path = "../swarms-macro" }
