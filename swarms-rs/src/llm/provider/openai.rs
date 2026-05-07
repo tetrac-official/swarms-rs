@@ -478,22 +478,41 @@ impl From<async_openai::types::CreateChatCompletionResponse>
             .flat_map(|choice| {
                 let content = choice.message.content.to_owned();
                 let tool_calls = choice.message.tool_calls.to_owned();
-                // OpenAI should always return content or tool_calls
                 if tool_calls.is_none() {
-                    let content =
-                        content.expect("OpenAI should always return content or tool_calls");
+                    // Reasoning models (and some OpenAI-compatible providers
+                    // mid-stream) return a choice with neither content nor
+                    // tool_calls — only a thinking block we don't see here.
+                    // Surface as empty text so the agent loop can retry or
+                    // treat as empty, instead of panicking the whole process.
+                    let content = content.unwrap_or_else(|| {
+                        tracing::warn!(
+                            "openai choice had neither content nor tool_calls; \
+                             returning empty text (reasoning model without exposed content?)"
+                        );
+                        String::new()
+                    });
                     vec![llm::completion::AssistantContent::text(content)]
                 } else {
                     let tool_calls = tool_calls.expect("We just checked that it is not None");
                     let tool_calls = tool_calls
                         .iter()
-                        .map(|tool_call| {
-                            llm::completion::AssistantContent::tool_call(
-                                tool_call.id.clone(),
-                                tool_call.function.name.clone(),
-                                serde_json::from_str(&tool_call.function.arguments)
-                                    .expect("OpenAI return invalid json"),
-                            )
+                        .filter_map(|tool_call| {
+                            match serde_json::from_str(&tool_call.function.arguments) {
+                                Ok(args) => Some(llm::completion::AssistantContent::tool_call(
+                                    tool_call.id.clone(),
+                                    tool_call.function.name.clone(),
+                                    args,
+                                )),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        name = %tool_call.function.name,
+                                        args = %tool_call.function.arguments,
+                                        "skipping tool call with invalid JSON args"
+                                    );
+                                    None
+                                }
+                            }
                         })
                         .collect::<Vec<_>>();
                     tool_calls
