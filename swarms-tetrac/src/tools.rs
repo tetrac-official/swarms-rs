@@ -245,6 +245,60 @@ async fn get_balance(exchange: String) -> Result<Vec<Balance>, TtcToolError> {
     .await
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct UsdBalance {
+    /// Asset name as the exchange reports it: USDT, USDC, DUSD, FDUSD, USDe, ...
+    pub asset: String,
+    /// Total balance in this asset.
+    pub balance: f64,
+    /// Available (unencumbered) balance in this asset — what you can spend.
+    pub available: f64,
+}
+
+#[tool(
+    description = "Available USD-denominated stablecoin balance on an exchange. \
+                   Wraps get_balance and picks the largest asset whose name contains \
+                   \"USD\" — covers USDT, USDC, DUSD, FDUSD, USDe, BUSD, etc. Use this \
+                   for trade sizing instead of get_balance when you need a single \
+                   number, since exchanges differ on which stablecoin they use.",
+    arg(exchange, description = "Exchange slug, e.g. \"phemex\".", required = true)
+)]
+async fn get_usd_balance(exchange: String) -> Result<UsdBalance, TtcToolError> {
+    with_auth_refresh(|| async {
+        let creds = credentials_for(&exchange)?;
+        let balances = runtime()?.client.get_balance(&exchange, creds).await?;
+        pick_usd_balance(&balances).ok_or_else(|| {
+            TtcToolError::InvalidArg(format!(
+                "no USD-stablecoin balance found on {exchange}; assets present: {:?}",
+                balances.iter().map(|b| &b.asset).collect::<Vec<_>>()
+            ))
+        })
+    })
+    .await
+}
+
+/// Pick the USD-stablecoin balance with the largest available amount.
+///
+/// Matches any asset whose name contains "USD" (case-insensitive), so
+/// USDT / USDC / BUSD / FDUSD / USDe / DUSD / TUSD / PYUSD / etc. all
+/// qualify. Returns the entry with the highest `available` value, since
+/// that's what's spendable for sizing a trade.
+fn pick_usd_balance(balances: &[Balance]) -> Option<UsdBalance> {
+    balances
+        .iter()
+        .filter(|b| b.asset.to_ascii_uppercase().contains("USD"))
+        .max_by(|a, b| {
+            a.available
+                .partial_cmp(&b.available)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|b| UsdBalance {
+            asset: b.asset.clone(),
+            balance: b.balance,
+            available: b.available,
+        })
+}
+
 #[tool(
     description = "Open or recent orders on a specific exchange.",
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
@@ -702,6 +756,50 @@ mod tests {
         });
         let v = dry_run_response("place_market_order", original.clone());
         assert_eq!(v["args"], original);
+    }
+
+    fn b(asset: &str, available: f64) -> Balance {
+        Balance {
+            asset: asset.into(),
+            balance: available,
+            available,
+            locked: None,
+        }
+    }
+
+    #[test]
+    fn pick_usd_balance_picks_largest_usd_asset() {
+        let balances = vec![b("BTC", 0.01), b("USDT", 100.0), b("USDC", 250.0), b("ETH", 1.0)];
+        let picked = pick_usd_balance(&balances).unwrap();
+        assert_eq!(picked.asset, "USDC");
+        assert_eq!(picked.available, 250.0);
+    }
+
+    #[test]
+    fn pick_usd_balance_matches_exotic_stablecoins() {
+        // Standx uses DUSD; Frax uses FDUSD; Ethena uses USDe.
+        let balances = vec![b("BTC", 5.0), b("DUSD", 800.0), b("FDUSD", 200.0), b("USDe", 50.0)];
+        let picked = pick_usd_balance(&balances).unwrap();
+        assert_eq!(picked.asset, "DUSD");
+    }
+
+    #[test]
+    fn pick_usd_balance_case_insensitive() {
+        let balances = vec![b("usdt", 42.0)];
+        let picked = pick_usd_balance(&balances).unwrap();
+        assert_eq!(picked.asset, "usdt");
+        assert_eq!(picked.available, 42.0);
+    }
+
+    #[test]
+    fn pick_usd_balance_returns_none_when_no_usd() {
+        let balances = vec![b("BTC", 1.0), b("ETH", 5.0)];
+        assert!(pick_usd_balance(&balances).is_none());
+    }
+
+    #[test]
+    fn pick_usd_balance_handles_empty() {
+        assert!(pick_usd_balance(&[]).is_none());
     }
 }
 

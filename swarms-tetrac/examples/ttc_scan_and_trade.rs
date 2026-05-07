@@ -31,7 +31,8 @@ use anyhow::{Context, Result};
 use swarms_rs::llm::provider::openai::OpenAI;
 use swarms_rs::structs::agent::Agent;
 use swarms_tetrac::tools::{
-    GetBalanceTool, GetFundingRatesTool, GetPositionsTool, GetScannerTool, PlaceMarketOrderTool,
+    GetFundingRatesTool, GetPositionsTool, GetScannerTool, GetUsdBalanceTool,
+    PlaceMarketOrderTool,
 };
 use swarms_tetrac::{
     CycleOutcome, LoopRunner, TtcConfig, TtcToolError, refresh_if_stale, with_auth_refresh,
@@ -108,26 +109,30 @@ async fn main() -> Result<()> {
         .agent_name("RiskCheck")
         .system_prompt(format!(
             "You are a TTC trade risk checker for exchange=\"{exchange}\".\n\
-             Tools: get_balance, get_positions.\n\
+             Tools: get_usd_balance, get_positions.\n\
              \n\
              You receive the upstream signal line as input. Then:\n\
-             1. get_balance exchange=\"{exchange}\" EXACTLY ONCE.\n\
+             1. get_usd_balance exchange=\"{exchange}\" EXACTLY ONCE. \
+                Returns the largest USD-stablecoin (USDT/USDC/DUSD/etc.) and its \
+                available amount — read \"asset\" and \"available\" from the result.\n\
              2. get_positions exchange=\"{exchange}\" EXACTLY ONCE. \
                 If errors (deserialization or 5xx), treat positions as unknown — \
                 do NOT abort.\n\
              3. Output ONE LINE:\n\
-                \"risk verdict=<PROCEED|SKIP> usdc_available=<amount|unknown> \
-                existing_position=<long|short|none|unknown> reason=<short>\"\n\
+                \"risk verdict=<PROCEED|SKIP> usd_asset=<symbol> usd_available=<amount|unknown> \
+                existing_position=<long|short|none|unknown> reason=<single-word-or-hyphenated>\"\n\
              4. End with <DONE>.\n\
              \n\
              Decision rules (in order):\n\
-             - SKIP if signal direction is neutral.\n\
-             - SKIP if signal confidence is low.\n\
-             - SKIP if get_balance errors or USDC is missing.\n\
-             - SKIP if existing_position is the same direction as the signal.\n\
-             - Otherwise PROCEED."
+             - SKIP if signal direction is neutral. reason=neutral\n\
+             - SKIP if signal confidence is low. reason=low-confidence\n\
+             - SKIP if get_usd_balance errors or available is 0. reason=no-stablecoin\n\
+             - SKIP if existing_position is the same direction as the signal. reason=already-positioned\n\
+             - Otherwise PROCEED. reason=signal-confirmed\n\
+             \n\
+             Reason MUST be a single word or hyphenated tokens — no spaces."
         ))
-        .add_tool(GetBalanceTool)
+        .add_tool(GetUsdBalanceTool)
         .add_tool(GetPositionsTool)
         .max_loops(4)
         .temperature(0.1)
@@ -148,7 +153,7 @@ async fn main() -> Result<()> {
                with action=SKIP and reason copied from the upstream risk reason. \
                End with <DONE>.\n\
              - If risk verdict is PROCEED:\n\
-               1. Compute qty = ({usd_pct}% of usdc_available) / entry. Round sensibly: \
+               1. Compute qty = ({usd_pct}% of usd_available) / entry. Round sensibly: \
                   BTC/ETH-priced symbols use 4 decimals; mid-priced use 2; sub-$1 use 0. \
                   If qty rounds to 0, output action=SKIP reason=qty-too-small (no tool call).\n\
                2. side = signal direction (long or short).\n\
@@ -158,7 +163,11 @@ async fn main() -> Result<()> {
              \n\
              Cycle line format (always exactly):\n\
              \"cycle <n>: action=<TRADE|SKIP> exchange={exchange} symbol={symbol} \
-             side=<long|short|n/a> qty=<q|n/a> reason=<short> dry_run=<true|false>\"\n\
+             side=<long|short|n/a> qty=<q|n/a> reason=<single-word-or-hyphenated> \
+             dry_run=<true|false>\"\n\
+             \n\
+             reason MUST be a single word or hyphenated tokens — no spaces, no quotes. \
+             Examples: \"neutral\", \"low-confidence\", \"no-stablecoin\", \"signal-confirmed\", \"qty-too-small\".\n\
              \n\
              End with <DONE>.\n\
              \n\
