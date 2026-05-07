@@ -631,12 +631,12 @@ async fn close_position(
     description = "Set leverage for a symbol on an exchange. Returns a dry-run envelope unless TTC_DRY_RUN=false.",
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
     arg(symbol, description = "Trading pair, e.g. \"BTCUSDT\".", required = true),
-    arg(leverage, description = "Leverage multiplier, e.g. 10.", required = true)
+    arg(leverage, description = "Leverage multiplier, e.g. 10. Some exchanges (Phemex) encode direction in the sign: -10 means 10× on the short side.", required = true)
 )]
 async fn set_leverage(
     exchange: String,
     symbol: String,
-    leverage: u32,
+    leverage: i32,
 ) -> Result<serde_json::Value, TtcToolError> {
     let symbol = normalize_symbol(&symbol);
     let echo = serde_json::json!({

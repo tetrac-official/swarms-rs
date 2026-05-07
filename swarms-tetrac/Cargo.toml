@@ -30,7 +30,7 @@ dotenvy = "0.15"
 # a `cargo update` doesn't silently change behavior — bump the rev
 # manually when you want the latest. Switch to `tag = "vX.Y.Z"` once
 # the upstream tags releases.
-skill-trading = { git = "https://github.com/tetrac-official/rust-cli-ttc-api", rev = "5254618c76db64246cccb8c5cb8b4467178f6296" }
+skill-trading = { git = "https://github.com/tetrac-official/rust-cli-ttc-api", rev = "efd30cce2d2986601c9e0d416c66ed8e1b416f0b" }
 
 # swarms-macro provides the #[tool] proc macro used in tools.rs.
 swarms-macro = { path = "../swarms-macro" }
