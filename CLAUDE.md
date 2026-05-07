@@ -4,6 +4,35 @@ This is a hard fork of `The-Swarm-Corporation/swarms-rs`, used as a
 **library wireframe** for the Tetrac (ttc.box) integration. We do not
 contribute upstream. Treat upstream as frozen reference code.
 
+## End goal
+
+Build the best agentic crypto trading framework in Rust. The swarms-rs
+agent — running 24/7, unsupervised, across the 34 supported exchanges —
+is the product. **The trader does not trade manually.** The agent
+trades. Manual CLI usage is for one-time setup (`skill-trading
+register`, `login`) and post-mortem diagnostics — never for placing
+orders.
+
+Every change in `swarms-tetrac` is judged by whether it moves the
+agent toward unattended operation: better tools, sharper prompts,
+self-healing auth, persistent state, risk guardrails, observability.
+Anything that requires a human in the loop during normal operation is
+a bug to fix, not a feature.
+
+## Working directory — hard boundary
+
+You work in **`/Users/mac/Documents/swarms-ai/swarms-rs/` only.** This
+is your one task. Never `Read`, `Edit`, `Write`, `Bash` against any
+other directory — including `/Users/mac/Documents/rust-cli-ttc-api/`,
+`/Users/mac/Documents/TTC/`, or anywhere else. If a fix seems to live
+outside this tree, the answer is: build it inside `swarms-tetrac`
+(adapt at the agent layer, normalize on our side, wrap as needed).
+Crossing the boundary is the wrong move every time.
+
+`rust-cli-ttc-api` (skill-trading) is consumed as a `cargo` git dep
+only. Treat it as a black-box library at a pinned SHA. Do not propose
+edits to it. Do not bring it up unless the user explicitly asks.
+
 ## Workflow
 
 - Work on feature branches off `main` (`feat/<thing>`, `fix/<thing>`,
