@@ -1,10 +1,12 @@
-//! Scan-and-trade daemon — one agent, five tools, on a LoopRunner tick.
+//! Scan-and-trade daemon — three-agent pipeline on a LoopRunner tick.
 //!
-//! Each cycle the agent reads the scanner + funding + balance + positions,
-//! then either places a sized market order or skips. The runner reads the
-//! agent's last line into a `CycleOutcome` so it can:
-//!   - cool off after a successful trade (no back-to-back blasting)
-//!   - back off on `Empty` (LLM rate-limited or output garbage)
+//! Each cycle runs Signal → Risk → Executor sequentially, with Rust-side
+//! short-circuits between stages (neutral / low-confidence / risk-SKIP)
+//! to skip later stages and save LLM calls on cheap rejections.
+//!
+//! Per-call context stays bounded (each agent only sees its own role's
+//! input), unlike a single-agent-with-many-tools shape where the
+//! conversation grows with each tool result.
 //!
 //! Dry-run by default; flip `TTC_DRY_RUN=false` only after watching dry
 //! envelopes look sane.
@@ -32,7 +34,7 @@ use swarms_tetrac::tools::{
     GetBalanceTool, GetFundingRatesTool, GetPositionsTool, GetScannerTool, PlaceMarketOrderTool,
 };
 use swarms_tetrac::{
-    CycleOutcome, LoopRunner, TtcConfig, refresh_if_stale, with_auth_refresh,
+    CycleOutcome, LoopRunner, TtcConfig, TtcToolError, refresh_if_stale, with_auth_refresh,
 };
 
 #[tokio::main]
@@ -59,53 +61,114 @@ async fn main() -> Result<()> {
     let api_key = env::var("OPENAI_API_KEY").context("OPENAI_API_KEY not set")?;
     let model = env::var("LLM_MODEL").unwrap_or_else(|_| "openai/gpt-4o".into());
 
+    if model.contains(":free") {
+        eprintln!(
+            "ttc_scan_and_trade: WARNING — LLM_MODEL={model} ends with ':free'. \
+             Free OpenRouter routes are rate-limited and often have flaky tool calling. \
+             If cycles return Empty, switch to a paid route or DeepSeek (deepseek-chat)."
+        );
+    }
+
     let client = OpenAI::from_url(base_url, api_key).set_model(&model);
 
-    let system_prompt = format!(
-        "You are a TTC scan-and-trade daemon. Each invocation, perform the steps below \
-         EXACTLY ONCE EACH, in order:\n\
-         \n\
-         1. get_scanner with symbol=\"{symbol}\" timeframe=\"1h\". Read direction \
-            (long/short/neutral) and confidence.\n\
-         2. get_funding_rates with symbol=\"{symbol}\". Note funding bias.\n\
-         3. get_balance with exchange=\"{exchange}\". Read available USDC.\n\
-         4. get_positions with exchange=\"{exchange}\". Check existing position. If this \
-            tool errors with a deserialization or 5xx error, treat positions as unknown \
-            and continue — do NOT abort the cycle.\n\
-         5. DECIDE:\n\
-            - SKIP if scanner direction is neutral.\n\
-            - SKIP if scanner confidence is LOW or missing.\n\
-            - SKIP if get_balance errored.\n\
-            - SKIP if an existing position on {symbol} is already in the signal direction.\n\
-            - Otherwise PROCEED: side = signal direction (long or short); \
-              quantity = ({usd_pct}% of available USDC) / current price. Use the scanner's \
-              entry/last price; if absent, use mid of any returned bid/ask. Round qty \
-              to a sensible precision for the symbol. If qty rounds to 0, SKIP.\n\
-         6. If PROCEED, call place_market_order EXACTLY ONCE with exchange=\"{exchange}\" \
-            symbol=\"{symbol}\" side=<long|short> quantity=<qty>. NEVER call it more than \
-            once per cycle, regardless of the response shape.\n\
-         7. Output ONE LINE in this EXACT format (no extra text), then end with <DONE>:\n\
-            \"cycle <n>: action=<TRADE|SKIP> exchange={exchange} symbol={symbol} \
-            side=<long|short|n/a> qty=<q|n/a> reason=<short> dry_run=<true|false>\"\n\
-         \n\
-         Notes:\n\
-         - Never invent numbers. Only use what tools return.\n\
-         - place_market_order may return a dry-run envelope of the form \
-           {{\"dry_run\": true, ...}}. Treat that as a successful trade and report \
-           dry_run=true.\n\
-         - When live, the response has the real order shape with order_id, status."
-    );
-
-    let agent = client
+    let signal_watch = client
         .agent_builder()
-        .agent_name("TtcScanAndTrade")
-        .system_prompt(system_prompt)
+        .agent_name("SignalWatch")
+        .system_prompt(format!(
+            "You are a TTC market signal watcher.\n\
+             Tools: get_scanner, get_funding_rates.\n\
+             \n\
+             Steps (each tool EXACTLY ONCE):\n\
+             1. get_scanner symbol=\"{symbol}\" timeframe=\"1h\".\n\
+             2. get_funding_rates symbol=\"{symbol}\".\n\
+             3. Output ONE LINE:\n\
+                \"signal direction=<long|short|neutral> confidence=<low|medium|high> \
+                entry=<price|n/a> funding_bias=<long|short|mixed|neutral>\"\n\
+             4. End with <DONE>.\n\
+             \n\
+             Field rules:\n\
+             - direction = scanner signal.direction (lowercase)\n\
+             - confidence = scanner signal.confidence (lowercase)\n\
+             - entry = scanner signal.entry, or n/a if missing\n\
+             - funding_bias: long if rates mostly positive, short if mostly negative, \
+               mixed if split, neutral if no data\n\
+             - If get_scanner errors, output direction=neutral confidence=low entry=n/a \
+               funding_bias=neutral and stop."
+        ))
         .add_tool(GetScannerTool)
         .add_tool(GetFundingRatesTool)
+        .max_loops(4)
+        .temperature(0.1)
+        .add_stop_word("<DONE>")
+        .verbose(false)
+        .build();
+
+    let risk_check = client
+        .agent_builder()
+        .agent_name("RiskCheck")
+        .system_prompt(format!(
+            "You are a TTC trade risk checker for exchange=\"{exchange}\".\n\
+             Tools: get_balance, get_positions.\n\
+             \n\
+             You receive the upstream signal line as input. Then:\n\
+             1. get_balance exchange=\"{exchange}\" EXACTLY ONCE.\n\
+             2. get_positions exchange=\"{exchange}\" EXACTLY ONCE. \
+                If errors (deserialization or 5xx), treat positions as unknown — \
+                do NOT abort.\n\
+             3. Output ONE LINE:\n\
+                \"risk verdict=<PROCEED|SKIP> usdc_available=<amount|unknown> \
+                existing_position=<long|short|none|unknown> reason=<short>\"\n\
+             4. End with <DONE>.\n\
+             \n\
+             Decision rules (in order):\n\
+             - SKIP if signal direction is neutral.\n\
+             - SKIP if signal confidence is low.\n\
+             - SKIP if get_balance errors or USDC is missing.\n\
+             - SKIP if existing_position is the same direction as the signal.\n\
+             - Otherwise PROCEED."
+        ))
         .add_tool(GetBalanceTool)
         .add_tool(GetPositionsTool)
+        .max_loops(4)
+        .temperature(0.1)
+        .add_stop_word("<DONE>")
+        .verbose(false)
+        .build();
+
+    let executor = client
+        .agent_builder()
+        .agent_name("Executor")
+        .system_prompt(format!(
+            "You are a TTC trade executor for exchange=\"{exchange}\" symbol=\"{symbol}\".\n\
+             Tools: place_market_order.\n\
+             \n\
+             You receive upstream signal and risk lines as input.\n\
+             \n\
+             - If risk verdict is SKIP: do NOT call any tool. Output the cycle line \
+               with action=SKIP and reason copied from the upstream risk reason. \
+               End with <DONE>.\n\
+             - If risk verdict is PROCEED:\n\
+               1. Compute qty = ({usd_pct}% of usdc_available) / entry. Round sensibly: \
+                  BTC/ETH-priced symbols use 4 decimals; mid-priced use 2; sub-$1 use 0. \
+                  If qty rounds to 0, output action=SKIP reason=qty-too-small (no tool call).\n\
+               2. side = signal direction (long or short).\n\
+               3. place_market_order exchange=\"{exchange}\" symbol=\"{symbol}\" \
+                  side=<side> quantity=<qty> EXACTLY ONCE.\n\
+               4. Output the cycle line with action=TRADE.\n\
+             \n\
+             Cycle line format (always exactly):\n\
+             \"cycle <n>: action=<TRADE|SKIP> exchange={exchange} symbol={symbol} \
+             side=<long|short|n/a> qty=<q|n/a> reason=<short> dry_run=<true|false>\"\n\
+             \n\
+             End with <DONE>.\n\
+             \n\
+             Notes:\n\
+             - <n> = cycle number from the user message (\"cycle 0\", \"cycle 1\", ...).\n\
+             - place_market_order may return {{\"dry_run\": true, ...}} — report dry_run=true.\n\
+             - Never call place_market_order more than once."
+        ))
         .add_tool(PlaceMarketOrderTool)
-        .max_loops(8)
+        .max_loops(3)
         .temperature(0.1)
         .add_stop_word("<DONE>")
         .verbose(false)
@@ -120,8 +183,8 @@ async fn main() -> Result<()> {
         }
     );
     eprintln!(
-        "ttc_scan_and_trade: interval={interval_secs}s max_ticks={} exchange={exchange} \
-         symbol={symbol} usd_pct={usd_pct} cooldown={cooldown_secs}s \
+        "ttc_scan_and_trade: 3-agent pipeline | interval={interval_secs}s max_ticks={} \
+         exchange={exchange} symbol={symbol} usd_pct={usd_pct} cooldown={cooldown_secs}s \
          rate_limit_backoff={rate_limit_backoff_secs}s",
         if max_ticks == 0 {
             "∞".into()
@@ -139,21 +202,64 @@ async fn main() -> Result<()> {
 
     runner
         .run_with_outcome(|cycle| {
-            let agent = &agent;
+            let signal_watch = &signal_watch;
+            let risk_check = &risk_check;
+            let executor = &executor;
             let exchange = exchange.clone();
             let symbol = symbol.clone();
             async move {
                 if let Err(e) = refresh_if_stale(max_token_age).await {
-                    tracing::warn!(error = %e, "proactive refresh failed; continuing with current token");
+                    tracing::warn!(error = %e, "proactive refresh failed; continuing");
                 }
-                let prompt = format!("Run cycle {cycle}. Follow the prescribed steps.");
-                let summary = with_auth_refresh(|| async {
-                    agent.run(prompt.clone()).await.map_err(|e| {
-                        swarms_tetrac::TtcToolError::InvalidArg(format!("agent error: {e:?}"))
+
+                let signal_prompt = format!("cycle {cycle}: scan {symbol}");
+                let signal = with_auth_refresh(|| async {
+                    signal_watch.run(signal_prompt.clone()).await.map_err(|e| {
+                        TtcToolError::InvalidArg(format!("signal_watch: {e:?}"))
                     })
                 })
                 .await?;
-                Ok(parse_outcome(&summary, &exchange, &symbol))
+                if !signal.contains("<DONE>") {
+                    tracing::warn!(stage = "signal", "agent returned without <DONE>");
+                    return Ok(CycleOutcome::Empty);
+                }
+                if signal.contains("direction=neutral") {
+                    return Ok(CycleOutcome::Skip {
+                        reason: "neutral".into(),
+                    });
+                }
+                if signal.contains("confidence=low") {
+                    return Ok(CycleOutcome::Skip {
+                        reason: "low-confidence".into(),
+                    });
+                }
+
+                let risk_prompt = format!("cycle {cycle}\n\n[signal]:\n{signal}");
+                let risk = with_auth_refresh(|| async {
+                    risk_check.run(risk_prompt.clone()).await.map_err(|e| {
+                        TtcToolError::InvalidArg(format!("risk_check: {e:?}"))
+                    })
+                })
+                .await?;
+                if !risk.contains("<DONE>") {
+                    tracing::warn!(stage = "risk", "agent returned without <DONE>");
+                    return Ok(CycleOutcome::Empty);
+                }
+                if risk.contains("verdict=SKIP") {
+                    let reason = extract_reason(&risk).unwrap_or_else(|| "risk-skip".into());
+                    return Ok(CycleOutcome::Skip { reason });
+                }
+
+                let exec_prompt = format!(
+                    "cycle {cycle}\n\n[signal]:\n{signal}\n\n[risk]:\n{risk}"
+                );
+                let exec_output = with_auth_refresh(|| async {
+                    executor.run(exec_prompt.clone()).await.map_err(|e| {
+                        TtcToolError::InvalidArg(format!("executor: {e:?}"))
+                    })
+                })
+                .await?;
+                Ok(parse_outcome(&exec_output, &exchange, &symbol))
             }
         })
         .await
@@ -164,11 +270,22 @@ async fn main() -> Result<()> {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
-/// Turn the agent's last "cycle <n>: action=... ..." line into a `CycleOutcome`.
-/// Treats missing / malformed output as `Empty` so the runner backs off.
+/// Pull `reason=...` out of the upstream risk line so we can report it on
+/// the cycle's Skip outcome instead of a generic "risk-skip".
+fn extract_reason(text: &str) -> Option<String> {
+    let line = text.lines().rfind(|l| l.contains("verdict="))?;
+    kv(line, "reason")
+}
+
+/// Turn the executor's last "cycle <n>: action=... ..." line into a
+/// `CycleOutcome`. Treats missing / malformed output as `Empty` so the
+/// runner backs off.
 fn parse_outcome(summary: &str, default_exchange: &str, default_symbol: &str) -> CycleOutcome {
     if !summary.contains("<DONE>") {
         return CycleOutcome::Empty;
@@ -206,9 +323,9 @@ fn parse_outcome(summary: &str, default_exchange: &str, default_symbol: &str) ->
     }
 }
 
-/// Extract a `key=value` token from a line. Stops the value at the next
-/// whitespace, so multi-word reasons get truncated to their first word —
-/// that's fine for log output, the structured fields keep precision.
+/// Extract `key=value` from a logfmt-ish line. Stops the value at whitespace,
+/// so multi-word reasons get truncated to their first word — fine for the
+/// outcome-summary log line; full text stays in the agent transcript.
 fn kv(line: &str, key: &str) -> Option<String> {
     let needle = format!("{key}=");
     let start = line.find(&needle)? + needle.len();
@@ -256,10 +373,7 @@ mod tests {
     #[test]
     fn parse_outcome_no_done_is_empty() {
         let s = "cycle 0: action=TRADE side=long qty=1.0 dry_run=true";
-        assert_eq!(
-            parse_outcome(s, "orderly", "BTC"),
-            CycleOutcome::Empty
-        );
+        assert_eq!(parse_outcome(s, "orderly", "BTC"), CycleOutcome::Empty);
     }
 
     #[test]
@@ -274,5 +388,17 @@ mod tests {
             CycleOutcome::Skip { reason } => assert!(reason.contains("rounded")),
             other => panic!("expected Skip, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_reason_pulls_from_risk_line() {
+        let s = "cycle 0\n\nrisk verdict=SKIP usdc_available=200 \
+                 existing_position=none reason=neutral\n<DONE>";
+        assert_eq!(extract_reason(s).as_deref(), Some("neutral"));
+    }
+
+    #[test]
+    fn extract_reason_returns_none_when_no_verdict_line() {
+        assert!(extract_reason("nothing here").is_none());
     }
 }
