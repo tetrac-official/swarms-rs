@@ -15,6 +15,6 @@ pub use config::{ConfigError, TtcConfig};
 pub use error::TtcToolError;
 pub use redact::{RedactingFields, init_tracing};
 pub use runtime::{
-    LoopRunner, refresh_auth, refresh_if_stale, token_age_if_stale, with_auth_refresh,
-    with_retry_on_auth,
+    CycleOutcome, LoopRunner, refresh_auth, refresh_if_stale, token_age_if_stale,
+    with_auth_refresh, with_retry_on_auth,
 };
