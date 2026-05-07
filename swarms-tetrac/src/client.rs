@@ -7,7 +7,7 @@ use skill_trading::models::ExchangeCredentials;
 use crate::TtcConfig;
 use crate::error::TtcToolError;
 
-pub(crate) struct TtcRuntime {
+pub struct TtcRuntime {
     pub client: Client,
     pub dry_run: bool,
 }
@@ -55,7 +55,7 @@ pub fn install(cfg: &TtcConfig) -> Result<(), TtcToolError> {
     Ok(())
 }
 
-pub(crate) fn runtime() -> Result<Arc<TtcRuntime>, TtcToolError> {
+pub fn runtime() -> Result<Arc<TtcRuntime>, TtcToolError> {
     let slot = SLOT.get().ok_or(TtcToolError::NotInstalled)?;
     Ok(slot.read().expect("runtime lock poisoned").clone())
 }
@@ -68,7 +68,7 @@ pub(crate) fn dry_run() -> Result<bool, TtcToolError> {
 /// existing env-var / config priority chain. Reads
 /// `{EXCHANGE}_API_KEY`, `{EXCHANGE}_API_SECRET`,
 /// `{EXCHANGE}_API_PASSPHRASE` from process env.
-pub(crate) fn credentials_for(exchange: &str) -> Result<ExchangeCredentials, TtcToolError> {
+pub fn credentials_for(exchange: &str) -> Result<ExchangeCredentials, TtcToolError> {
     let settings = AppConfig::default();
     Ok(skill_trading::commands::common::get_credentials(
         exchange, None, None, None, &settings,

@@ -2,7 +2,7 @@
 //!
 //! See `tetrac-integration.md` at the workspace root for the PRD.
 
-mod client;
+pub mod client;
 pub mod config;
 pub mod error;
 mod parsers;
