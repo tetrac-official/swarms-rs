@@ -127,8 +127,11 @@ async fn main() -> Result<()> {
              - SKIP if signal direction is neutral. reason=neutral\n\
              - SKIP if signal confidence is low. reason=low-confidence\n\
              - SKIP if get_usd_balance errors or available is 0. reason=no-stablecoin\n\
-             - SKIP if existing_position is the same direction as the signal. reason=already-positioned\n\
              - Otherwise PROCEED. reason=signal-confirmed\n\
+             \n\
+             NOTE: existing_position is reported for observability only. A separate \
+             deterministic Rust guard between this stage and the executor handles \
+             position-conflict skipping — do NOT skip on existing_position yourself.\n\
              \n\
              Reason MUST be a single word or hyphenated tokens — no spaces."
         ))
@@ -259,6 +262,29 @@ async fn main() -> Result<()> {
                     return Ok(CycleOutcome::Skip { reason });
                 }
 
+                // Deterministic position-conflict guard. The agent's
+                // existing_position field is informational only; this is the
+                // load-bearing check. Conservative default: any open position
+                // on the target symbol blocks a new trade. In Phemex's merged
+                // position mode a sell-while-long would reduce/flip the long
+                // (paying fees, losing exposure), and a buy-while-long would
+                // average up (potentially over-leveraging). Both are surprises
+                // we don't want unattended.
+                match check_position_conflict(&exchange, &symbol).await {
+                    Ok(Some(dir)) => {
+                        return Ok(CycleOutcome::Skip {
+                            reason: format!("already-positioned-{dir}"),
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "position conflict check failed; skipping cycle");
+                        return Ok(CycleOutcome::Skip {
+                            reason: "position-check-failed".into(),
+                        });
+                    }
+                }
+
                 let exec_prompt = format!(
                     "cycle {cycle}\n\n[signal]:\n{signal}\n\n[risk]:\n{risk}"
                 );
@@ -283,6 +309,43 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// Pure logic for conflict detection — picks the first non-empty position
+/// on `symbol` and returns its direction ("long"/"short"). Returns `None`
+/// if no conflicting position exists.
+fn detect_position_conflict(
+    positions: &[skill_trading::models::Position],
+    symbol: &str,
+) -> Option<String> {
+    for pos in positions {
+        if pos.symbol == symbol && pos.size > 0.0 {
+            let dir = match pos.side.as_str() {
+                "buy" => "long",
+                "sell" => "short",
+                other => other,
+            };
+            return Some(dir.to_string());
+        }
+    }
+    None
+}
+
+/// Async wrapper: fetches positions via the runtime client and runs
+/// `detect_position_conflict`. Errors propagate to the caller, which
+/// treats them as Skip-with-reason rather than Proceed.
+async fn check_position_conflict(
+    exchange: &str,
+    symbol: &str,
+) -> Result<Option<String>, TtcToolError> {
+    let rt = swarms_tetrac::client::runtime()?;
+    let creds = swarms_tetrac::client::credentials_for(exchange)?;
+    let positions = rt
+        .client
+        .get_positions(exchange, Some(symbol), creds)
+        .await
+        .map_err(TtcToolError::Api)?;
+    Ok(detect_position_conflict(&positions, symbol))
 }
 
 /// Pull `reason=...` out of the upstream risk line so we can report it on
@@ -409,5 +472,58 @@ mod tests {
     #[test]
     fn extract_reason_returns_none_when_no_verdict_line() {
         assert!(extract_reason("nothing here").is_none());
+    }
+
+    fn pos(symbol: &str, side: &str, size: f64) -> skill_trading::models::Position {
+        skill_trading::models::Position {
+            symbol: symbol.into(),
+            side: side.into(),
+            position_side: "merged".into(),
+            size,
+            entry_price: 100.0,
+            mark_price: 100.0,
+            pnl: None,
+            leverage: -10,
+            liquidation_price: None,
+            margin_type: Some("cross".into()),
+            unrealized_pnl: None,
+            notional: None,
+        }
+    }
+
+    #[test]
+    fn detect_conflict_returns_none_for_empty_positions() {
+        assert!(detect_position_conflict(&[], "BTCUSDT").is_none());
+    }
+
+    #[test]
+    fn detect_conflict_returns_none_when_no_match_on_target_symbol() {
+        let positions = vec![pos("ETHUSDT", "buy", 1.0), pos("SOLUSDT", "sell", 5.0)];
+        assert!(detect_position_conflict(&positions, "BTCUSDT").is_none());
+    }
+
+    #[test]
+    fn detect_conflict_returns_long_for_buy_side() {
+        let positions = vec![pos("ZROUSDT", "buy", 133.0)];
+        assert_eq!(
+            detect_position_conflict(&positions, "ZROUSDT").as_deref(),
+            Some("long")
+        );
+    }
+
+    #[test]
+    fn detect_conflict_returns_short_for_sell_side() {
+        let positions = vec![pos("BTCUSDT", "sell", 0.001)];
+        assert_eq!(
+            detect_position_conflict(&positions, "BTCUSDT").as_deref(),
+            Some("short")
+        );
+    }
+
+    #[test]
+    fn detect_conflict_skips_zero_size_positions() {
+        // A zero-size entry might appear briefly after a close; treat as no conflict.
+        let positions = vec![pos("BTCUSDT", "buy", 0.0)];
+        assert!(detect_position_conflict(&positions, "BTCUSDT").is_none());
     }
 }
