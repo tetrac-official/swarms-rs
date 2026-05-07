@@ -801,5 +801,35 @@ mod tests {
     fn pick_usd_balance_handles_empty() {
         assert!(pick_usd_balance(&[]).is_none());
     }
+
+    #[test]
+    fn phemex_short_position_deserializes_after_leverage_fix() {
+        // Regression: Phemex encodes short direction in the sign of `leverage`
+        // (-10 = 10x short, +10 = 10x long). skill-trading originally typed
+        // Position::leverage as u32, so any short position blew up the
+        // deserializer. This fixture is the shape that bit us live; if anyone
+        // downgrades the skill-trading rev or reverts the i32 fix, this goes red.
+        use skill_trading::models::Position;
+        let json = r#"[{
+            "symbol":"BTCUSDT",
+            "side":"short",
+            "positionSide":"short",
+            "size":0.0002,
+            "entryPrice":80000.0,
+            "markPrice":79900.0,
+            "pnl":0.02,
+            "leverage":-10,
+            "liquidationPrice":null,
+            "marginType":"cross",
+            "unrealizedPnl":0.02,
+            "notional":16.0
+        }]"#;
+        let positions: Vec<Position> = serde_json::from_str(json)
+            .expect("phemex short with negative leverage must deserialize");
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].leverage, -10);
+        assert_eq!(positions[0].symbol, "BTCUSDT");
+        assert_eq!(positions[0].side, "short");
+    }
 }
 
