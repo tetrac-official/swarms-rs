@@ -8,6 +8,18 @@ use skill_trading::models::{MarginMode, OrderSide, PositionSide, TimeInForce, Tr
 
 use crate::error::TtcToolError;
 
+/// Strip non-alphanumeric characters and uppercase. The TTC backend and
+/// most exchange APIs expect compact symbols like "BTCUSDT", never
+/// "BTC-USDT" / "BTC/USDT" / "btc_usdt". LLMs frequently hand us the
+/// punctuated form from documentation; normalize at the boundary so every
+/// downstream call sees the canonical shape.
+pub(crate) fn normalize_symbol(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
 pub(crate) fn parse_side(s: &str) -> Result<OrderSide, TtcToolError> {
     match s.trim().to_lowercase().as_str() {
         "buy" => Ok(OrderSide::Buy),
@@ -129,5 +141,19 @@ mod tests {
         assert!(matches!(parse_margin_mode("isolated"), Ok(MarginMode::Isolated)));
         assert!(matches!(parse_margin_mode("CROSS"), Ok(MarginMode::Cross)));
         assert!(parse_margin_mode("hybrid").is_err());
+    }
+
+    #[test]
+    fn normalize_symbol_strips_separators_and_uppercases() {
+        assert_eq!(normalize_symbol("BTC-USDT"), "BTCUSDT");
+        assert_eq!(normalize_symbol("btc-usdt"), "BTCUSDT");
+        assert_eq!(normalize_symbol("BTC/USDT"), "BTCUSDT");
+        assert_eq!(normalize_symbol("btc_usdt"), "BTCUSDT");
+        assert_eq!(normalize_symbol("BTC.USDT"), "BTCUSDT");
+        assert_eq!(normalize_symbol("BTCUSDT"), "BTCUSDT");
+        assert_eq!(normalize_symbol(" BTC USDT "), "BTCUSDT");
+        assert_eq!(normalize_symbol("OIL/USDT"), "OILUSDT");
+        assert_eq!(normalize_symbol("nas100usdt"), "NAS100USDT");
+        assert_eq!(normalize_symbol("NAS100-USDT"), "NAS100USDT");
     }
 }

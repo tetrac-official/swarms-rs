@@ -18,7 +18,8 @@ use swarms_macro::tool;
 use crate::client::{credentials_for, dry_run, runtime};
 use crate::error::TtcToolError;
 use crate::parsers::{
-    parse_margin_mode, parse_position_side, parse_side, parse_time_in_force, parse_trigger_type,
+    normalize_symbol, parse_margin_mode, parse_position_side, parse_side, parse_time_in_force,
+    parse_trigger_type,
 };
 use crate::runtime::with_auth_refresh;
 
@@ -50,7 +51,7 @@ fn dry_run_response(action: &str, args: serde_json::Value) -> serde_json::Value 
         description = "Filter by exchange slug, e.g. \"binance\", \"orderly\".",
         required = false
     ),
-    arg(symbol, description = "Filter by symbol, e.g. \"BTC-USDT\".", required = false),
+    arg(symbol, description = "Filter by symbol, e.g. \"BTCUSDT\".", required = false),
     arg(min_volume, description = "Minimum 24h quote volume.", required = false),
     arg(min_price, description = "Minimum last price.", required = false),
     arg(max_price, description = "Maximum last price.", required = false),
@@ -68,6 +69,7 @@ async fn get_hybrid_tickers(
     up: Option<f64>,
     down: Option<f64>,
 ) -> Result<HybridTickersData, TtcToolError> {
+    let symbol = symbol.as_deref().map(normalize_symbol);
     with_auth_refresh(|| async {
         Ok(runtime()?
             .client
@@ -90,11 +92,12 @@ async fn get_hybrid_tickers(
     description = "Funding rates across exchanges, optionally filtered by symbol.",
     arg(
         symbol,
-        description = "Optional symbol filter, e.g. \"BTC-USDT\".",
+        description = "Optional symbol filter, e.g. \"BTCUSDT\".",
         required = false
     )
 )]
 async fn get_funding_rates(symbol: Option<String>) -> Result<Vec<FundingRate>, TtcToolError> {
+    let symbol = symbol.as_deref().map(normalize_symbol);
     with_auth_refresh(|| async {
         Ok(runtime()?
             .client
@@ -108,11 +111,12 @@ async fn get_funding_rates(symbol: Option<String>) -> Result<Vec<FundingRate>, T
     description = "Open interest across exchanges, optionally filtered by symbol.",
     arg(
         symbol,
-        description = "Optional symbol filter, e.g. \"BTC-USDT\".",
+        description = "Optional symbol filter, e.g. \"BTCUSDT\".",
         required = false
     )
 )]
 async fn get_open_interest(symbol: Option<String>) -> Result<Vec<OpenInterestItem>, TtcToolError> {
+    let symbol = symbol.as_deref().map(normalize_symbol);
     with_auth_refresh(|| async {
         Ok(runtime()?
             .client
@@ -144,6 +148,7 @@ async fn get_scanner(
     bars: Option<u32>,
     swing_strength: Option<u32>,
 ) -> Result<ScannerResult, TtcToolError> {
+    let symbol = normalize_symbol(&symbol);
     with_auth_refresh(|| async {
         Ok(runtime()?
             .client
@@ -162,7 +167,7 @@ async fn get_scanner(
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
     arg(
         symbol,
-        description = "Optional symbol filter, e.g. \"BTC-USDT\".",
+        description = "Optional symbol filter, e.g. \"BTCUSDT\".",
         required = false
     )
 )]
@@ -170,6 +175,7 @@ async fn get_tickers(
     exchange: String,
     symbol: Option<String>,
 ) -> Result<Vec<Ticker>, TtcToolError> {
+    let symbol = symbol.as_deref().map(normalize_symbol);
     with_auth_refresh(|| async {
         let creds = credentials_for(&exchange)?;
         let params = GetTickersParams {
@@ -186,9 +192,10 @@ async fn get_tickers(
 #[tool(
     description = "Best bid and ask for a symbol on a specific exchange.",
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
-    arg(symbol, description = "Trading pair, e.g. \"BTC-USDT\".", required = true)
+    arg(symbol, description = "Trading pair, e.g. \"BTCUSDT\".", required = true)
 )]
 async fn get_best_bid_ask(exchange: String, symbol: String) -> Result<BestBidAsk, TtcToolError> {
+    let symbol = normalize_symbol(&symbol);
     with_auth_refresh(|| async {
         let creds = credentials_for(&exchange)?;
         let params = GetBestBidAskParams {
@@ -207,7 +214,7 @@ async fn get_best_bid_ask(exchange: String, symbol: String) -> Result<BestBidAsk
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
     arg(
         symbol,
-        description = "Optional symbol filter, e.g. \"BTC-USDT\".",
+        description = "Optional symbol filter, e.g. \"BTCUSDT\".",
         required = false
     )
 )]
@@ -215,6 +222,7 @@ async fn get_positions(
     exchange: String,
     symbol: Option<String>,
 ) -> Result<Vec<Position>, TtcToolError> {
+    let symbol = symbol.as_deref().map(normalize_symbol);
     with_auth_refresh(|| async {
         let creds = credentials_for(&exchange)?;
         Ok(runtime()?
@@ -242,7 +250,7 @@ async fn get_balance(exchange: String) -> Result<Vec<Balance>, TtcToolError> {
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
     arg(
         symbol,
-        description = "Optional symbol filter, e.g. \"BTC-USDT\".",
+        description = "Optional symbol filter, e.g. \"BTCUSDT\".",
         required = false
     )
 )]
@@ -250,6 +258,7 @@ async fn get_orders(
     exchange: String,
     symbol: Option<String>,
 ) -> Result<Vec<Order>, TtcToolError> {
+    let symbol = symbol.as_deref().map(normalize_symbol);
     with_auth_refresh(|| async {
         let creds = credentials_for(&exchange)?;
         Ok(runtime()?
@@ -267,7 +276,7 @@ async fn get_orders(
 #[tool(
     description = "Place a market order on an exchange. Returns a dry-run envelope unless TTC_DRY_RUN=false.",
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
-    arg(symbol, description = "Trading pair, e.g. \"BTC-USDT\".", required = true),
+    arg(symbol, description = "Trading pair, e.g. \"BTCUSDT\".", required = true),
     arg(side, description = "\"buy\" or \"sell\".", required = true),
     arg(quantity, description = "Order quantity in base units.", required = true),
     arg(
@@ -287,6 +296,7 @@ async fn place_market_order(
     reduce_only: Option<bool>,
     client_order_id: Option<String>,
 ) -> Result<serde_json::Value, TtcToolError> {
+    let symbol = normalize_symbol(&symbol);
     let echo = serde_json::json!({
         "exchange": exchange,
         "symbol": symbol,
@@ -325,7 +335,7 @@ async fn place_market_order(
 pub struct PlaceLimitOrderInput {
     /// Exchange slug, e.g. "orderly".
     pub exchange: String,
-    /// Trading pair, e.g. "BTC-USDT".
+    /// Trading pair, e.g. "BTCUSDT".
     pub symbol: String,
     /// "buy" or "sell".
     pub side: String,
@@ -351,6 +361,8 @@ pub struct PlaceLimitOrderInput {
     description = "Place a limit order on an exchange. Returns a dry-run envelope unless TTC_DRY_RUN=false."
 )]
 async fn place_limit_order(args: PlaceLimitOrderInput) -> Result<serde_json::Value, TtcToolError> {
+    let mut args = args;
+    args.symbol = normalize_symbol(&args.symbol);
     let echo = serde_json::to_value(&args)?;
     if dry_run()? {
         return Ok(dry_run_response("place_limit_order", echo));
@@ -390,7 +402,7 @@ async fn place_limit_order(args: PlaceLimitOrderInput) -> Result<serde_json::Val
 pub struct PlaceStopOrderInput {
     /// Exchange slug, e.g. "orderly".
     pub exchange: String,
-    /// Trading pair, e.g. "BTC-USDT".
+    /// Trading pair, e.g. "BTCUSDT".
     pub symbol: String,
     /// "buy" or "sell".
     pub side: String,
@@ -414,6 +426,8 @@ pub struct PlaceStopOrderInput {
     description = "Place a stop order on an exchange. Returns a dry-run envelope unless TTC_DRY_RUN=false."
 )]
 async fn place_stop_order(args: PlaceStopOrderInput) -> Result<serde_json::Value, TtcToolError> {
+    let mut args = args;
+    args.symbol = normalize_symbol(&args.symbol);
     let echo = serde_json::to_value(&args)?;
     if dry_run()? {
         return Ok(dry_run_response("place_stop_order", echo));
@@ -452,7 +466,7 @@ async fn place_stop_order(args: PlaceStopOrderInput) -> Result<serde_json::Value
 #[tool(
     description = "Cancel a specific order. Returns a dry-run envelope unless TTC_DRY_RUN=false.",
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
-    arg(symbol, description = "Trading pair, e.g. \"BTC-USDT\".", required = true),
+    arg(symbol, description = "Trading pair, e.g. \"BTCUSDT\".", required = true),
     arg(order_id, description = "Order id to cancel.", required = false),
     arg(client_order_id, description = "Client-set order id to cancel.", required = false)
 )]
@@ -462,6 +476,7 @@ async fn cancel_order(
     order_id: Option<String>,
     client_order_id: Option<String>,
 ) -> Result<serde_json::Value, TtcToolError> {
+    let symbol = normalize_symbol(&symbol);
     let echo = serde_json::json!({
         "exchange": exchange,
         "symbol": symbol,
@@ -490,12 +505,13 @@ async fn cancel_order(
 #[tool(
     description = "Cancel all open orders on an exchange, optionally scoped to a symbol. Returns a dry-run envelope unless TTC_DRY_RUN=false.",
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
-    arg(symbol, description = "Optional symbol scope, e.g. \"BTC-USDT\".", required = false)
+    arg(symbol, description = "Optional symbol scope, e.g. \"BTCUSDT\".", required = false)
 )]
 async fn cancel_all_orders(
     exchange: String,
     symbol: Option<String>,
 ) -> Result<serde_json::Value, TtcToolError> {
+    let symbol = symbol.as_deref().map(normalize_symbol);
     let echo = serde_json::json!({ "exchange": exchange, "symbol": symbol });
     if dry_run()? {
         return Ok(dry_run_response("cancel_all_orders", echo));
@@ -514,7 +530,7 @@ async fn cancel_all_orders(
 #[tool(
     description = "Close an open position on an exchange (full or partial). Returns a dry-run envelope unless TTC_DRY_RUN=false.",
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
-    arg(symbol, description = "Trading pair to close, e.g. \"BTC-USDT\".", required = true),
+    arg(symbol, description = "Trading pair to close, e.g. \"BTCUSDT\".", required = true),
     arg(
         position_side,
         description = "\"long\" / \"short\" / \"both\". Required for hedge-mode accounts.",
@@ -528,6 +544,7 @@ async fn close_position(
     position_side: Option<String>,
     quantity: Option<f64>,
 ) -> Result<serde_json::Value, TtcToolError> {
+    let symbol = normalize_symbol(&symbol);
     let echo = serde_json::json!({
         "exchange": exchange,
         "symbol": symbol,
@@ -559,7 +576,7 @@ async fn close_position(
 #[tool(
     description = "Set leverage for a symbol on an exchange. Returns a dry-run envelope unless TTC_DRY_RUN=false.",
     arg(exchange, description = "Exchange slug, e.g. \"orderly\".", required = true),
-    arg(symbol, description = "Trading pair, e.g. \"BTC-USDT\".", required = true),
+    arg(symbol, description = "Trading pair, e.g. \"BTCUSDT\".", required = true),
     arg(leverage, description = "Leverage multiplier, e.g. 10.", required = true)
 )]
 async fn set_leverage(
@@ -567,6 +584,7 @@ async fn set_leverage(
     symbol: String,
     leverage: u32,
 ) -> Result<serde_json::Value, TtcToolError> {
+    let symbol = normalize_symbol(&symbol);
     let echo = serde_json::json!({
         "exchange": exchange,
         "symbol": symbol,
@@ -605,6 +623,7 @@ async fn set_margin_mode(
     margin_mode: String,
     symbol: Option<String>,
 ) -> Result<serde_json::Value, TtcToolError> {
+    let symbol = symbol.as_deref().map(normalize_symbol);
     let echo = serde_json::json!({
         "exchange": exchange,
         "margin_mode": margin_mode,
