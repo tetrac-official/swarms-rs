@@ -250,68 +250,10 @@ async fn try_trade(
         _ => unreachable!(),
     };
 
-    tracing::info!(
-        symbol,
-        direction = %direction,
-        confidence = %scan.signal.confidence,
-        rr,
-        entry,
-        stop,
-        qty,
-        notional = qty * entry,
-        "PLACING entry"
-    );
-
-    place_market(exchange, symbol, entry_side, qty).await?;
-
-    // Poll briefly to find the actual position size after fill, then protect.
-    let pos_size = if dry {
-        qty
-    } else {
-        match poll_for_position(exchange, symbol, 20, 500).await? {
-            Some(p) => p.size,
-            None => {
-                tracing::error!(
-                    symbol,
-                    "position never appeared after market order; SKIPPING stop/TP"
-                );
-                return Ok(TradeOutcome::Placed {
-                    risk_usd: balance * risk_pct / 100.0,
-                });
-            }
-        }
-    };
-    let pos_side_for_orders = if dry {
-        PositionSide::Both
-    } else {
-        // Re-fetch to get the real position_side.
-        match fetch_position(exchange, symbol).await? {
-            Some(p) => phemex_position_side(&p.position_side),
-            None => PositionSide::Both,
-        }
-    };
-    let mark = if dry {
-        entry
-    } else {
-        match fetch_position(exchange, symbol).await? {
-            Some(p) => p.mark_price,
-            None => entry,
-        }
-    };
-
-    if let Err(e) = place_stop(
-        exchange,
-        symbol,
-        close_side,
-        pos_side_for_orders,
-        pos_size,
-        clamp_stop_for_direction(&direction, stop, mark),
-    )
-    .await
-    {
-        tracing::error!(symbol, error = format!("{e:#}"), "stop placement failed");
-    }
-
+    // Decide stop + TP prices upfront. We use entry as the mark proxy
+    // (we don't have a fresh mark fetch yet, and the scanner just gave us
+    // the current entry — close enough for clamp/validity checks).
+    let stop_price = clamp_stop_for_direction(&direction, stop, entry);
     let scanner_tps: Vec<f64> = [
         scan.signal.take_profit1,
         scan.signal.take_profit2,
@@ -319,30 +261,220 @@ async fn try_trade(
     ]
     .into_iter()
     .flatten()
-    .filter(|&p| tp_is_valid_for_direction(&direction, p, mark))
+    .filter(|&p| tp_is_valid_for_direction(&direction, p, entry))
     .collect();
-    let target = target_tp_count(pos_size * mark, tp_layer_threshold());
-    let tps: Vec<f64> = if scanner_tps.is_empty() {
-        fallback_tp_prices(&direction, mark, fallback_tp_step_pct(), target)
+    let target = target_tp_count(qty * entry, tp_layer_threshold());
+    let tp_prices: Vec<f64> = if scanner_tps.is_empty() {
+        fallback_tp_prices(&direction, entry, fallback_tp_step_pct(), target)
     } else {
         scanner_tps.into_iter().take(target).collect()
     };
-    let n = tps.len();
-    let chunks = split_qty(pos_size, n, entry);
-    for (price, q) in tps.iter().zip(chunks.iter()) {
-        if *q <= 0.0 {
+    let pos_side = PositionSide::Both;
+
+    tracing::info!(
+        symbol,
+        direction = %direction,
+        confidence = %scan.signal.confidence,
+        rr,
+        entry,
+        stop = stop_price,
+        qty,
+        notional = qty * entry,
+        tp_count = tp_prices.len(),
+        "PLACING entry + protections"
+    );
+
+    if dry {
+        log_dry_run(symbol, entry_side, qty, stop_price, &tp_prices);
+        return Ok(TradeOutcome::Placed {
+            risk_usd: balance * risk_pct / 100.0,
+        });
+    }
+
+    // Live path. Fire market then stop+TPs back-to-back. Track every order
+    // ID we successfully placed so we can roll them back if the position
+    // fails to materialize.
+    let mut placed_ids: Vec<String> = Vec::new();
+
+    let market_id = match place_market(exchange, symbol, entry_side, qty).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(symbol, error = format!("{e:#}"), "market entry failed");
+            return Ok(TradeOutcome::Skipped {
+                reason: "market-failed".into(),
+            });
+        }
+    };
+    if let Some(id) = market_id {
+        placed_ids.push(id);
+    }
+
+    if let Some(id) = place_stop_safe(exchange, symbol, close_side, pos_side, qty, stop_price).await {
+        placed_ids.push(id);
+    }
+
+    let tp_chunks = split_qty(qty, tp_prices.len(), entry);
+    let tp_pairs: Vec<(f64, f64)> = tp_prices
+        .iter()
+        .zip(tp_chunks.iter())
+        .map(|(p, q)| (*p, *q))
+        .collect();
+    for (price, chunk) in &tp_pairs {
+        if *chunk <= 0.0 {
             continue;
         }
-        if let Err(e) = place_tp(exchange, symbol, close_side, pos_side_for_orders, *q, *price)
-            .await
+        if let Some(id) =
+            place_tp_safe(exchange, symbol, close_side, pos_side, *chunk, *price).await
         {
-            tracing::error!(symbol, tp_price = price, error = format!("{e:#}"), "TP placement failed");
+            placed_ids.push(id);
+        }
+    }
+
+    // Wait briefly for the market order to fill on the matching engine.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // ONE position check.
+    let position = match fetch_position(exchange, symbol).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                symbol,
+                error = format!("{e:#}"),
+                "post-trade position check failed; orders left as-is — verify manually"
+            );
+            return Ok(TradeOutcome::Placed {
+                risk_usd: balance * risk_pct / 100.0,
+            });
+        }
+    };
+    let Some(_pos) = position else {
+        // No position formed (rejected entry, or still pending). Cancel any
+        // protective orders we placed so they don't dangle on a non-existent
+        // position.
+        tracing::warn!(
+            symbol,
+            placed = placed_ids.len(),
+            "position not present after entry; cancelling placed orders"
+        );
+        for id in &placed_ids {
+            if let Err(e) = cancel_order_by_id(exchange, symbol, id).await {
+                tracing::error!(symbol, order_id = %id, error = format!("{e:#}"), "cancel failed");
+            }
+        }
+        return Ok(TradeOutcome::Skipped {
+            reason: "no-fill".into(),
+        });
+    };
+
+    // Position exists. ONE get_orders to verify protections are on the books.
+    let orders = match list_orders(exchange, symbol).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(
+                symbol,
+                error = format!("{e:#}"),
+                "post-trade get_orders failed; assuming protections placed — verify manually"
+            );
+            return Ok(TradeOutcome::Placed {
+                risk_usd: balance * risk_pct / 100.0,
+            });
+        }
+    };
+    let state = analyze_orders(&orders, &direction);
+    if !state.has_stop {
+        tracing::warn!(symbol, "stop missing post-fill; retrying");
+        let _ = place_stop_safe(exchange, symbol, close_side, pos_side, qty, stop_price).await;
+    }
+    if !state.has_tp && !tp_pairs.is_empty() {
+        tracing::warn!(symbol, "TPs missing post-fill; retrying");
+        for (price, chunk) in &tp_pairs {
+            if *chunk <= 0.0 {
+                continue;
+            }
+            let _ =
+                place_tp_safe(exchange, symbol, close_side, pos_side, *chunk, *price).await;
         }
     }
 
     Ok(TradeOutcome::Placed {
         risk_usd: balance * risk_pct / 100.0,
     })
+}
+
+fn log_dry_run(symbol: &str, side: OrderSide, qty: f64, stop: f64, tps: &[f64]) {
+    tracing::info!(symbol, ?side, qty, stop, tp_count = tps.len(), "dry-run: would submit");
+    for (i, tp) in tps.iter().enumerate() {
+        tracing::info!(symbol, tp_index = i + 1, tp_price = tp, "dry-run TP");
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderState {
+    has_stop: bool,
+    has_tp: bool,
+}
+
+fn analyze_orders(orders: &[skill_trading::models::Order], direction: &str) -> OrderState {
+    let close = match direction {
+        "long" => "sell",
+        "short" => "buy",
+        _ => "",
+    };
+    let mut s = OrderState { has_stop: false, has_tp: false };
+    for o in orders {
+        if !o.side.eq_ignore_ascii_case(close) {
+            continue;
+        }
+        let kind = o.order_type.to_lowercase();
+        if kind.contains("stop") {
+            s.has_stop = true;
+        } else if kind == "limit" {
+            s.has_tp = true;
+        }
+    }
+    s
+}
+
+/// Try to place a stop, returning the order_id on success or None on
+/// error (which is logged). This shape lets the caller track placed IDs
+/// for cleanup without bailing on failure mid-trade.
+async fn place_stop_safe(
+    exchange: &str,
+    symbol: &str,
+    close_side: OrderSide,
+    pos_side: PositionSide,
+    quantity: f64,
+    stop_price: f64,
+) -> Option<String> {
+    match place_stop(exchange, symbol, close_side, pos_side, quantity, stop_price).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(symbol, error = format!("{e:#}"), "stop placement failed");
+            None
+        }
+    }
+}
+
+async fn place_tp_safe(
+    exchange: &str,
+    symbol: &str,
+    close_side: OrderSide,
+    pos_side: PositionSide,
+    quantity: f64,
+    tp_price: f64,
+) -> Option<String> {
+    match place_tp(exchange, symbol, close_side, pos_side, quantity, tp_price).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(
+                symbol,
+                tp_price,
+                error = format!("{e:#}"),
+                "TP placement failed"
+            );
+            None
+        }
+    }
 }
 
 // -------- env helpers --------
@@ -392,24 +524,6 @@ async fn fetch_position(exchange: &str, symbol: &str) -> Result<Option<Position>
         .find(|p| p.symbol == symbol && p.size > 0.0))
 }
 
-async fn poll_for_position(
-    exchange: &str,
-    symbol: &str,
-    max_attempts: u32,
-    delay_ms: u64,
-) -> Result<Option<Position>> {
-    for attempt in 0..max_attempts {
-        if let Some(p) = fetch_position(exchange, symbol).await? {
-            tracing::debug!(attempt = attempt + 1, "position found");
-            return Ok(Some(p));
-        }
-        if attempt + 1 < max_attempts {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        }
-    }
-    Ok(None)
-}
-
 async fn scan_symbol(exchange: &str, symbol: &str, timeframe: &str) -> Result<ScannerResult> {
     let rt = swarms_tetrac::client::runtime()?;
     let _ = exchange;
@@ -426,7 +540,7 @@ async fn place_market(
     symbol: &str,
     side: OrderSide,
     quantity: f64,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let rt = swarms_tetrac::client::runtime()?;
     let creds = swarms_tetrac::client::credentials_for(exchange)?;
     let params = skill_trading::models::MarketOrderParams {
@@ -439,15 +553,15 @@ async fn place_market(
     };
     if rt.dry_run {
         tracing::info!(symbol, ?side, quantity, "dry-run: would place market entry");
-        return Ok(());
+        return Ok(None);
     }
     let order = rt
         .client
         .place_market_order(exchange, params, creds)
         .await
         .context("place_market_order failed")?;
-    tracing::info!(symbol, ?side, quantity, ?order, "market entry placed");
-    Ok(())
+    tracing::info!(symbol, ?side, quantity, order_id = %order.order_id, "market entry placed");
+    Ok(Some(order.order_id))
 }
 
 async fn place_stop(
@@ -457,7 +571,7 @@ async fn place_stop(
     pos_side: PositionSide,
     quantity: f64,
     stop_price: f64,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let rt = swarms_tetrac::client::runtime()?;
     let creds = swarms_tetrac::client::credentials_for(exchange)?;
     let params = StopOrderParams {
@@ -474,15 +588,15 @@ async fn place_stop(
     };
     if rt.dry_run {
         tracing::info!(symbol, quantity, stop_price, "dry-run: would place stop");
-        return Ok(());
+        return Ok(None);
     }
     let order = rt
         .client
         .place_stop_order(exchange, params, creds)
         .await
         .context("place_stop_order failed")?;
-    tracing::info!(symbol, quantity, stop_price, ?order, "stop placed");
-    Ok(())
+    tracing::info!(symbol, quantity, stop_price, order_id = %order.order_id, "stop placed");
+    Ok(Some(order.order_id))
 }
 
 async fn place_tp(
@@ -492,7 +606,7 @@ async fn place_tp(
     pos_side: PositionSide,
     quantity: f64,
     tp_price: f64,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let rt = swarms_tetrac::client::runtime()?;
     let creds = swarms_tetrac::client::credentials_for(exchange)?;
     let params = LimitOrderParams {
@@ -509,15 +623,40 @@ async fn place_tp(
     };
     if rt.dry_run {
         tracing::info!(symbol, quantity, tp_price, "dry-run: would place TP limit");
-        return Ok(());
+        return Ok(None);
     }
     let order = rt
         .client
         .place_limit_order(exchange, params, creds)
         .await
         .context("place_limit_order failed")?;
-    tracing::info!(symbol, quantity, tp_price, ?order, "TP limit placed");
+    tracing::info!(symbol, quantity, tp_price, order_id = %order.order_id, "TP limit placed");
+    Ok(Some(order.order_id))
+}
+
+async fn cancel_order_by_id(exchange: &str, symbol: &str, order_id: &str) -> Result<()> {
+    let rt = swarms_tetrac::client::runtime()?;
+    let creds = swarms_tetrac::client::credentials_for(exchange)?;
+    let params = skill_trading::models::CancelOrderParams {
+        symbol: symbol.into(),
+        order_id: Some(order_id.into()),
+        client_order_id: None,
+    };
+    rt.client
+        .cancel_order(exchange, params, creds)
+        .await
+        .context("cancel_order failed")?;
+    tracing::info!(symbol, order_id, "order cancelled");
     Ok(())
+}
+
+async fn list_orders(exchange: &str, symbol: &str) -> Result<Vec<skill_trading::models::Order>> {
+    let rt = swarms_tetrac::client::runtime()?;
+    let creds = swarms_tetrac::client::credentials_for(exchange)?;
+    rt.client
+        .get_orders(exchange, Some(symbol), creds)
+        .await
+        .with_context(|| format!("get_orders failed for {exchange} {symbol}"))
 }
 
 // -------- math helpers (duplicated from other examples; refactor later) --------
@@ -639,14 +778,6 @@ fn clamp_stop_for_direction(direction: &str, scanner_stop: f64, mark: f64) -> f6
             "long" => mark * (1.0 - factor),
             _ => mark,
         }
-    }
-}
-
-fn phemex_position_side(reported: &str) -> PositionSide {
-    match reported.trim().to_lowercase().as_str() {
-        "long" => PositionSide::Long,
-        "short" => PositionSide::Short,
-        _ => PositionSide::Both,
     }
 }
 
