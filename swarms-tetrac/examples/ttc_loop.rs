@@ -18,7 +18,7 @@
 //!
 //! Tunable via env (all optional):
 //!   TRADE_EXCHANGE          default "phemex"
-//!   TRADE_SYMBOLS           default: 15-symbol perp list (comma-separated)
+//!   TRADE_SYMBOLS           default: 4-symbol perp list (comma-separated)
 //!   TRADE_RISK_PCT          default 0.1 (per-trade risk as % of balance)
 //!   TRADE_MAX_EXPOSURE_PCT  default 1.0 (stop opening trades after this much
 //!                                        cumulative risk, % of balance)
@@ -47,9 +47,7 @@ use skill_trading::models::{
 };
 use swarms_tetrac::TtcConfig;
 
-const DEFAULT_SYMBOLS: &str = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,\
-    ADAUSDT,AVAXUSDT,DOGEUSDT,LINKUSDT,DOTUSDT,ATOMUSDT,NEARUSDT,ARBUSDT,\
-    OPUSDT,SUIUSDT";
+const DEFAULT_SYMBOLS: &str = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT";
 
 #[tokio::main]
 async fn main() -> Result<()> {
