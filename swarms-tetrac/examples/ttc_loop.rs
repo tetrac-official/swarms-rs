@@ -31,6 +31,7 @@
 //!   MAX_PASSES              default 1   (set 0 to loop forever)
 //!   INTER_TRADE_DELAY_MS    default 1000 (pause between trades in a sweep)
 
+use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 
@@ -107,12 +108,33 @@ async fn main() -> Result<()> {
         let max_risk_usd = balance * max_exposure_pct / 100.0;
         let per_trade_risk_usd = balance * risk_pct / 100.0;
 
+        // ONE get_positions for the whole sweep. We use this to skip symbols
+        // we already hold without per-symbol round trips. Each new entry we
+        // open inside this sweep is a fresh symbol (the conflict guard on
+        // the cached set ensures we don't double up), so the cache stays
+        // valid for the duration of the sweep.
+        let positioned: HashSet<String> = match fetch_all_positions(&exchange).await {
+            Ok(positions) => positions
+                .into_iter()
+                .filter(|p| p.size > 0.0)
+                .map(|p| p.symbol)
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "couldn't read positions cache; per-symbol guard will fall back to remote"
+                );
+                HashSet::new()
+            }
+        };
+
         tracing::info!(
             pass,
             balance,
             max_risk_usd,
             per_trade_risk_usd,
             symbols = symbols.len(),
+            cached_positions = positioned.len(),
             "starting sweep"
         );
 
@@ -136,6 +158,7 @@ async fn main() -> Result<()> {
                 risk_pct,
                 min_rr,
                 dry,
+                &positioned,
             )
             .await
             {
@@ -181,6 +204,7 @@ enum TradeOutcome {
     Skipped { reason: String },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_trade(
     exchange: &str,
     symbol: &str,
@@ -189,8 +213,9 @@ async fn try_trade(
     risk_pct: f64,
     min_rr: f64,
     dry: bool,
+    positioned: &HashSet<String>,
 ) -> Result<TradeOutcome> {
-    if has_position(exchange, symbol).await? {
+    if positioned.contains(symbol) {
         return Ok(TradeOutcome::Skipped {
             reason: "already-positioned".into(),
         });
@@ -269,7 +294,16 @@ async fn try_trade(
     } else {
         scanner_tps.into_iter().take(target).collect()
     };
-    let pos_side = PositionSide::Both;
+    // Use the trade's actual direction. ttc.box → phemex translates
+    // PositionSide::Both inconsistently (we saw a Long entry get
+    // posSide=Short on the protective stop URL, leading to
+    // TE_REDUCE_ONLY_ABORT). Sending the matching direction is reliable
+    // for both hedge mode and one-way mode in practice.
+    let pos_side = match direction.as_str() {
+        "long" => PositionSide::Long,
+        "short" => PositionSide::Short,
+        _ => PositionSide::Both,
+    };
 
     tracing::info!(
         symbol,
@@ -308,6 +342,11 @@ async fn try_trade(
     if let Some(id) = market_id {
         placed_ids.push(id);
     }
+
+    // Brief pause to let phemex's matching engine register the position
+    // before we submit the reduce_only stop. Without this, the stop racy-
+    // fails with TE_REDUCE_ONLY_ABORT (no position to reduce yet).
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     if let Some(id) = place_stop_safe(exchange, symbol, close_side, pos_side, qty, stop_price).await {
         placed_ids.push(id);
@@ -507,8 +546,13 @@ async fn fetch_usd_balance(exchange: &str) -> Result<f64> {
     Ok(usd)
 }
 
-async fn has_position(exchange: &str, symbol: &str) -> Result<bool> {
-    Ok(fetch_position(exchange, symbol).await?.is_some())
+async fn fetch_all_positions(exchange: &str) -> Result<Vec<Position>> {
+    let rt = swarms_tetrac::client::runtime()?;
+    let creds = swarms_tetrac::client::credentials_for(exchange)?;
+    rt.client
+        .get_positions(exchange, None, creds)
+        .await
+        .with_context(|| format!("get_positions (all) failed for {exchange}"))
 }
 
 async fn fetch_position(exchange: &str, symbol: &str) -> Result<Option<Position>> {
