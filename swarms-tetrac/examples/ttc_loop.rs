@@ -326,16 +326,13 @@ async fn try_trade(
     } else {
         scanner_tps.into_iter().take(target).collect()
     };
-    // Use the trade's actual direction. ttc.box → phemex translates
-    // PositionSide::Both inconsistently (we saw a Long entry get
-    // posSide=Short on the protective stop URL, leading to
-    // TE_REDUCE_ONLY_ABORT). Sending the matching direction is reliable
-    // for both hedge mode and one-way mode in practice.
-    let pos_side = match direction.as_str() {
-        "long" => PositionSide::Long,
-        "short" => PositionSide::Short,
-        _ => PositionSide::Both,
-    };
+    // Always Both. The protector (which uses the position's reported
+    // position_side string, "merged" → Both for one-way phemex accounts)
+    // places stops successfully. The loop's earlier direction-derived
+    // value (Short for shorts) gets TE_REDUCE_ONLY_ABORT in one-way mode
+    // because phemex expects merged/Both, not the per-direction value.
+    // If we ever need hedge-mode support, switch on account mode here.
+    let pos_side = PositionSide::Both;
 
     tracing::info!(
         symbol,
