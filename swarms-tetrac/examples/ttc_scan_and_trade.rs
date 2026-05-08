@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
              3. Output ONE LINE:\n\
                 \"signal direction=<long|short|neutral> confidence=<low|medium|high> \
                 entry=<price|n/a> stop_loss=<price|n/a> \
+                tp1=<price|n/a> tp2=<price|n/a> tp3=<price|n/a> \
                 funding_bias=<long|short|mixed|neutral>\"\n\
              4. End with <DONE>.\n\
              \n\
@@ -103,10 +104,13 @@ async fn main() -> Result<()> {
              - confidence = scanner signal.confidence (lowercase)\n\
              - entry = scanner signal.entry, or n/a if missing\n\
              - stop_loss = scanner signal.stopLoss, or n/a if missing\n\
+             - tp1 = scanner signal.takeProfit1, or n/a if null/missing\n\
+             - tp2 = scanner signal.takeProfit2, or n/a if null/missing\n\
+             - tp3 = scanner signal.takeProfit3, or n/a if null/missing\n\
              - funding_bias: long if rates mostly positive, short if mostly negative, \
                mixed if split, neutral if no data\n\
              - If get_scanner errors, output direction=neutral confidence=low entry=n/a \
-               stop_loss=n/a funding_bias=neutral and stop."
+               stop_loss=n/a tp1=n/a tp2=n/a tp3=n/a funding_bias=neutral and stop."
         ))
         .add_tool(GetScannerTool)
         .add_tool(GetFundingRatesTool)
@@ -297,6 +301,9 @@ async fn main() -> Result<()> {
                 let direction = kv(&signal, "direction").unwrap_or_default();
                 let entry = kv(&signal, "entry").and_then(|v| v.parse::<f64>().ok());
                 let stop = kv(&signal, "stop_loss").and_then(|v| v.parse::<f64>().ok());
+                let tp1 = kv(&signal, "tp1").and_then(|v| v.parse::<f64>().ok());
+                let tp2 = kv(&signal, "tp2").and_then(|v| v.parse::<f64>().ok());
+                let tp3 = kv(&signal, "tp3").and_then(|v| v.parse::<f64>().ok());
                 let balance = kv(&risk, "usd_available").and_then(|v| v.parse::<f64>().ok());
                 let (entry, stop, balance) = match (entry, stop, balance) {
                     (Some(e), Some(s), Some(b)) => (e, s, b),
@@ -332,7 +339,22 @@ async fn main() -> Result<()> {
                     })
                 })
                 .await?;
-                Ok(parse_outcome(&exec_output, &exchange, &symbol))
+                let outcome = parse_outcome(&exec_output, &exchange, &symbol, dry);
+
+                // Post-trade orders: stop-loss + layered take-profits, all
+                // reduce_only. Best-effort — if any of these fail, we log and
+                // return the Trade outcome anyway (the position is already
+                // open; failing the cycle wouldn't roll it back). The user
+                // sees the failure in the logs and can act manually.
+                if matches!(outcome, CycleOutcome::Trade { .. }) {
+                    let tps: Vec<f64> = [tp1, tp2, tp3].into_iter().flatten().collect();
+                    place_post_trade_orders(
+                        &exchange, &symbol, &direction, qty, stop, &tps, dry,
+                    )
+                    .await;
+                }
+
+                Ok(outcome)
             }
         })
         .await
@@ -461,7 +483,16 @@ fn extract_reason(text: &str) -> Option<String> {
 /// Turn the executor's last "cycle <n>: action=... ..." line into a
 /// `CycleOutcome`. Treats missing / malformed output as `Empty` so the
 /// runner backs off.
-fn parse_outcome(summary: &str, default_exchange: &str, default_symbol: &str) -> CycleOutcome {
+///
+/// `daemon_dry_run` overrides any `dry_run=...` claim the agent makes:
+/// the agent's output is unreliable (we've seen it print `dry_run=true`
+/// while the daemon was live), but the daemon knows its own mode for sure.
+fn parse_outcome(
+    summary: &str,
+    default_exchange: &str,
+    default_symbol: &str,
+    daemon_dry_run: bool,
+) -> CycleOutcome {
     if !summary.contains("<DONE>") {
         return CycleOutcome::Empty;
     }
@@ -474,9 +505,6 @@ fn parse_outcome(summary: &str, default_exchange: &str, default_symbol: &str) ->
 
     let action = kv(line, "action").unwrap_or_default();
     let reason = kv(line, "reason").unwrap_or_else(|| "(unknown)".into());
-    let dry_run = kv(line, "dry_run")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
 
     if action.eq_ignore_ascii_case("trade") {
         let side = kv(line, "side").unwrap_or_default();
@@ -491,11 +519,212 @@ fn parse_outcome(summary: &str, default_exchange: &str, default_symbol: &str) ->
             symbol: kv(line, "symbol").unwrap_or_else(|| default_symbol.into()),
             side,
             qty,
-            dry_run,
+            dry_run: daemon_dry_run,
         }
     } else {
         CycleOutcome::Skip { reason }
     }
+}
+
+/// Side of the closing/protecting order (opposite of the entry direction).
+/// Long entries close with sells; shorts close with buys.
+fn close_side_for(entry_direction: &str) -> Option<skill_trading::models::OrderSide> {
+    match entry_direction {
+        "long" => Some(skill_trading::models::OrderSide::Sell),
+        "short" => Some(skill_trading::models::OrderSide::Buy),
+        _ => None,
+    }
+}
+
+/// Top-level coordinator for "after the entry order, set protections."
+/// In live mode: poll until the position appears, then place stop + TPs
+/// using the actual filled size. In dry mode: skip polling, use the
+/// computed qty so we still exercise the order-placement wiring against
+/// dry-run envelopes.
+///
+/// All errors are logged, never propagated — the entry order is already
+/// open and we'd rather report a partial setup than crash the daemon.
+async fn place_post_trade_orders(
+    exchange: &str,
+    symbol: &str,
+    entry_direction: &str,
+    intended_qty: f64,
+    stop_price: f64,
+    tp_prices: &[f64],
+    dry: bool,
+) {
+    let Some(close_side) = close_side_for(entry_direction) else {
+        tracing::error!(direction = entry_direction, "unknown direction; skipping post-trade orders");
+        return;
+    };
+
+    let position_size = if dry {
+        tracing::info!(
+            symbol,
+            qty = intended_qty,
+            "dry-run: using computed qty for stop/TP sizing (skipping position poll)"
+        );
+        intended_qty
+    } else {
+        match poll_for_position(exchange, symbol, 20, 500).await {
+            Ok(Some(pos)) => {
+                tracing::info!(symbol, size = pos.size, "position confirmed; placing protections");
+                pos.size
+            }
+            Ok(None) => {
+                tracing::error!(
+                    symbol,
+                    "position never appeared after market order; SKIPPING stop/TP placement — set them manually"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "polling for position failed; skipping stop/TP placement");
+                return;
+            }
+        }
+    };
+
+    if let Err(e) = place_stop_loss_order(exchange, symbol, close_side, position_size, stop_price).await {
+        tracing::error!(error = %e, stop_price, "stop-loss placement FAILED — set one manually");
+    }
+
+    if tp_prices.is_empty() {
+        tracing::info!("no take-profit levels in scanner output; skipping TP layer");
+        return;
+    }
+
+    let chunks = split_qty_for_tps(position_size, tp_prices.len(), stop_price);
+    for (tp_price, chunk_qty) in tp_prices.iter().zip(chunks.iter()) {
+        if *chunk_qty <= 0.0 {
+            tracing::warn!(tp_price, "tp chunk rounds to zero; skipping this level");
+            continue;
+        }
+        if let Err(e) = place_take_profit_limit(
+            exchange, symbol, close_side, *chunk_qty, *tp_price,
+        )
+        .await
+        {
+            tracing::error!(error = %e, tp_price, "TP limit placement failed");
+        }
+    }
+}
+
+/// Split a position size across N take-profit levels, rounding each chunk
+/// to a sensible precision for the symbol's price tier. Returns a Vec the
+/// same length as `n_tps`. The last chunk gets any remainder so the sum
+/// matches the original size as closely as rounding allows.
+fn split_qty_for_tps(total: f64, n_tps: usize, reference_price: f64) -> Vec<f64> {
+    if n_tps == 0 || total <= 0.0 {
+        return Vec::new();
+    }
+    let raw = total / n_tps as f64;
+    let chunk = round_qty_for_price(raw, reference_price);
+    let mut out = vec![chunk; n_tps];
+    // Adjust the last chunk so chunks sum to total within rounding.
+    let assigned = chunk * (n_tps - 1) as f64;
+    let last = round_qty_for_price(total - assigned, reference_price);
+    out[n_tps - 1] = last.max(0.0);
+    out
+}
+
+async fn poll_for_position(
+    exchange: &str,
+    symbol: &str,
+    max_attempts: u32,
+    delay_ms: u64,
+) -> Result<Option<skill_trading::models::Position>, TtcToolError> {
+    let rt = swarms_tetrac::client::runtime()?;
+    for attempt in 0..max_attempts {
+        let creds = swarms_tetrac::client::credentials_for(exchange)?;
+        let positions = rt
+            .client
+            .get_positions(exchange, Some(symbol), creds)
+            .await
+            .map_err(TtcToolError::Api)?;
+        if let Some(pos) = positions.iter().find(|p| p.symbol == symbol && p.size > 0.0) {
+            tracing::debug!(attempt = attempt + 1, "position found");
+            return Ok(Some(pos.clone()));
+        }
+        if attempt + 1 < max_attempts {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+    Ok(None)
+}
+
+async fn place_stop_loss_order(
+    exchange: &str,
+    symbol: &str,
+    close_side: skill_trading::models::OrderSide,
+    quantity: f64,
+    stop_price: f64,
+) -> Result<(), TtcToolError> {
+    let rt = swarms_tetrac::client::runtime()?;
+    let creds = swarms_tetrac::client::credentials_for(exchange)?;
+    let params = skill_trading::models::StopOrderParams {
+        symbol: symbol.into(),
+        side: close_side,
+        quantity,
+        stop_price,
+        position_side: None,
+        trigger_type: None,
+        price: None,
+        close_position: None,
+        reduce_only: Some(true),
+        client_order_id: None,
+    };
+    if rt.dry_run {
+        tracing::info!(
+            symbol, quantity, stop_price,
+            "dry-run: would place stop-loss (reduce_only)"
+        );
+        return Ok(());
+    }
+    let order = rt
+        .client
+        .place_stop_order(exchange, params, creds)
+        .await
+        .map_err(TtcToolError::Api)?;
+    tracing::info!(symbol, quantity, stop_price, ?order, "stop-loss placed");
+    Ok(())
+}
+
+async fn place_take_profit_limit(
+    exchange: &str,
+    symbol: &str,
+    close_side: skill_trading::models::OrderSide,
+    quantity: f64,
+    tp_price: f64,
+) -> Result<(), TtcToolError> {
+    let rt = swarms_tetrac::client::runtime()?;
+    let creds = swarms_tetrac::client::credentials_for(exchange)?;
+    let params = skill_trading::models::LimitOrderParams {
+        symbol: symbol.into(),
+        side: close_side,
+        quantity,
+        price: tp_price,
+        position_side: None,
+        time_in_force: Some(skill_trading::models::TimeInForce::GoodTillCancel),
+        reduce_only: Some(true),
+        take_profit_price: None,
+        stop_loss_price: None,
+        client_order_id: None,
+    };
+    if rt.dry_run {
+        tracing::info!(
+            symbol, quantity, tp_price,
+            "dry-run: would place TP limit (reduce_only)"
+        );
+        return Ok(());
+    }
+    let order = rt
+        .client
+        .place_limit_order(exchange, params, creds)
+        .await
+        .map_err(TtcToolError::Api)?;
+    tracing::info!(symbol, quantity, tp_price, ?order, "TP limit placed");
+    Ok(())
 }
 
 /// Extract `key=value` from a logfmt-ish line. Stops the value at whitespace,
@@ -514,10 +743,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_outcome_trade_line() {
+    fn parse_outcome_trade_line_uses_daemon_dry_run() {
         let s = "cycle 0: action=TRADE exchange=phemex symbol=BTCUSDT side=short \
                  qty=0.001 reason=signal dry_run=true\n<DONE>";
-        match parse_outcome(s, "orderly", "ETHUSDT") {
+        // Agent claims dry_run=true; daemon says it's live. Daemon wins.
+        match parse_outcome(s, "orderly", "ETHUSDT", false) {
             CycleOutcome::Trade {
                 exchange,
                 symbol,
@@ -529,7 +759,7 @@ mod tests {
                 assert_eq!(symbol, "BTCUSDT");
                 assert_eq!(side, "short");
                 assert!((qty - 0.001).abs() < 1e-9);
-                assert!(dry_run);
+                assert!(!dry_run, "daemon's live state must override agent's claim");
             }
             other => panic!("expected Trade, got {other:?}"),
         }
@@ -539,7 +769,7 @@ mod tests {
     fn parse_outcome_skip_line() {
         let s = "cycle 1: action=SKIP exchange=phemex symbol=BTCUSDT side=n/a \
                  qty=n/a reason=neutral dry_run=true\n<DONE>";
-        match parse_outcome(s, "orderly", "ETHUSDT") {
+        match parse_outcome(s, "orderly", "ETHUSDT", true) {
             CycleOutcome::Skip { reason } => assert_eq!(reason, "neutral"),
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -548,18 +778,18 @@ mod tests {
     #[test]
     fn parse_outcome_no_done_is_empty() {
         let s = "cycle 0: action=TRADE side=long qty=1.0 dry_run=true";
-        assert_eq!(parse_outcome(s, "orderly", "BTC"), CycleOutcome::Empty);
+        assert_eq!(parse_outcome(s, "orderly", "BTC", true), CycleOutcome::Empty);
     }
 
     #[test]
     fn parse_outcome_blank_is_empty() {
-        assert_eq!(parse_outcome("", "orderly", "BTC"), CycleOutcome::Empty);
+        assert_eq!(parse_outcome("", "orderly", "BTC", true), CycleOutcome::Empty);
     }
 
     #[test]
     fn parse_outcome_trade_with_zero_qty_falls_to_skip() {
         let s = "cycle 0: action=TRADE side=long qty=0 reason=rounded dry_run=true\n<DONE>";
-        match parse_outcome(s, "orderly", "BTC") {
+        match parse_outcome(s, "orderly", "BTC", true) {
             CycleOutcome::Skip { reason } => assert!(reason.contains("rounded")),
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -702,5 +932,59 @@ mod tests {
     fn round_qty_sub_dollar_uses_whole_tokens() {
         // SWARMS at $0.0277: 526.7 → 527 (round to 0)
         assert!((round_qty_for_price(526.7, 0.0277) - 527.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn split_qty_for_one_tp_uses_full_size() {
+        let chunks = split_qty_for_tps(10.0, 1, 50.0);
+        assert_eq!(chunks, vec![10.0]);
+    }
+
+    #[test]
+    fn split_qty_for_three_tps_splits_evenly() {
+        let chunks = split_qty_for_tps(9.0, 3, 50.0);
+        assert_eq!(chunks.len(), 3);
+        // 9/3 = 3 each, mid-priced rounds to 2 decimals → exact.
+        let total: f64 = chunks.iter().sum();
+        assert!((total - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn split_qty_handles_uneven_chunks() {
+        // 10 / 3 = 3.333... per chunk; reference price $50 (mid-priced) rounds to 3.33.
+        // Last chunk gets the remainder so the sum stays at 10.
+        let chunks = split_qty_for_tps(10.0, 3, 50.0);
+        assert_eq!(chunks.len(), 3);
+        let total: f64 = chunks.iter().sum();
+        assert!(
+            (total - 10.0).abs() < 0.01,
+            "chunks should sum close to total; got {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn split_qty_for_zero_tps_returns_empty() {
+        assert!(split_qty_for_tps(10.0, 0, 50.0).is_empty());
+    }
+
+    #[test]
+    fn close_side_for_long_returns_sell() {
+        assert!(matches!(
+            close_side_for("long"),
+            Some(skill_trading::models::OrderSide::Sell)
+        ));
+    }
+
+    #[test]
+    fn close_side_for_short_returns_buy() {
+        assert!(matches!(
+            close_side_for("short"),
+            Some(skill_trading::models::OrderSide::Buy)
+        ));
+    }
+
+    #[test]
+    fn close_side_for_garbage_returns_none() {
+        assert!(close_side_for("sideways").is_none());
     }
 }
