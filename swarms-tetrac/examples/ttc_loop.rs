@@ -27,6 +27,11 @@
 //!   PROTECT_FALLBACK_STOP_PCT      default 5
 //!   PROTECT_FALLBACK_TP_STEP_PCT   default 2.5
 //!   PROTECT_TP_LAYER_THRESHOLD     default 30
+//!   MIN_STOP_DISTANCE_PCT   default 0.5 (% of entry. If scanner stop is tighter
+//!                                        than this, widen it to this distance
+//!                                        and recompute qty so risk % stays the
+//!                                        same. Prevents the "tight stop → huge
+//!                                        notional → race-fail" trap.)
 //!   TICK_INTERVAL_SECS      default 300 (sleep between full sweeps)
 //!   MAX_PASSES              default 1   (set 0 to loop forever)
 //!   INTER_TRADE_DELAY_MS    default 1000 (pause between trades in a sweep)
@@ -240,7 +245,7 @@ async fn try_trade(
         });
     }
     let entry = scan.signal.entry;
-    let stop = match scan.signal.stop_loss {
+    let scanner_stop = match scan.signal.stop_loss {
         Some(s) => s,
         None => {
             return Ok(TradeOutcome::Skipped {
@@ -248,6 +253,24 @@ async fn try_trade(
             });
         }
     };
+
+    // Widen the stop if it's too tight. Risk math is unchanged; the wider
+    // distance just produces a smaller position. Keeps notional sane on
+    // sub-1% setups and gives phemex some breathing room before the stop
+    // race-fails on adverse moves between scanner read and order placement.
+    let min_distance_pct = min_stop_distance_pct();
+    let stop = widen_stop_if_too_tight(&direction, entry, scanner_stop, min_distance_pct);
+    if (stop - scanner_stop).abs() > f64::EPSILON {
+        let scanner_dist_pct = (entry - scanner_stop).abs() / entry * 100.0;
+        tracing::info!(
+            symbol,
+            scanner_stop,
+            scanner_distance_pct = scanner_dist_pct,
+            widened_stop = stop,
+            min_distance_pct,
+            "stop too tight; widened to minimum"
+        );
+    }
 
     let qty_raw = match compute_risk_qty(&direction, entry, stop, balance, risk_pct) {
         Ok(q) => q,
@@ -777,6 +800,31 @@ fn fallback_stop_pct() -> f64 {
     env_f64("PROTECT_FALLBACK_STOP_PCT", 5.0)
 }
 
+fn min_stop_distance_pct() -> f64 {
+    env_f64("MIN_STOP_DISTANCE_PCT", 0.5)
+}
+
+/// If the scanner's stop is closer to entry than `min_pct` percent of entry,
+/// widen it to exactly that distance. Returns the scanner's stop unchanged
+/// when it's already wide enough. Direction-aware: shorts widen above entry,
+/// longs widen below.
+fn widen_stop_if_too_tight(direction: &str, entry: f64, scanner_stop: f64, min_pct: f64) -> f64 {
+    if entry <= 0.0 || min_pct <= 0.0 {
+        return scanner_stop;
+    }
+    let factor = min_pct / 100.0;
+    let min_distance = entry * factor;
+    let current_distance = (entry - scanner_stop).abs();
+    if current_distance >= min_distance {
+        return scanner_stop;
+    }
+    match direction {
+        "short" => entry * (1.0 + factor),
+        "long" => entry * (1.0 - factor),
+        _ => scanner_stop,
+    }
+}
+
 fn fallback_tp_step_pct() -> f64 {
     env_f64("PROTECT_FALLBACK_TP_STEP_PCT", 2.5)
 }
@@ -871,5 +919,52 @@ mod tests {
     fn split_qty_three_chunks_sum_to_total() {
         let chunks = split_qty(9.0, 3, 50.0);
         assert!((chunks.iter().sum::<f64>() - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn widen_stop_keeps_already_wide_short() {
+        // Scanner stop 1% above entry; min 0.5%. Already wide enough → unchanged.
+        let s = widen_stop_if_too_tight("short", 100.0, 101.0, 0.5);
+        assert_eq!(s, 101.0);
+    }
+
+    #[test]
+    fn widen_stop_widens_too_tight_short() {
+        // Scanner stop 0.1% above entry; min 0.5%. Widen to 100.5.
+        let s = widen_stop_if_too_tight("short", 100.0, 100.1, 0.5);
+        assert!((s - 100.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn widen_stop_keeps_already_wide_long() {
+        // Long: stop below entry. 1% below is wider than min 0.5%, keep.
+        let s = widen_stop_if_too_tight("long", 100.0, 99.0, 0.5);
+        assert_eq!(s, 99.0);
+    }
+
+    #[test]
+    fn widen_stop_widens_too_tight_long() {
+        // Long with stop only 0.1% below entry; min 0.5%. Widen to 99.5.
+        let s = widen_stop_if_too_tight("long", 100.0, 99.9, 0.5);
+        assert!((s - 99.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn widen_stop_unknown_direction_passes_through() {
+        let s = widen_stop_if_too_tight("merged", 100.0, 100.1, 0.5);
+        assert_eq!(s, 100.1);
+    }
+
+    #[test]
+    fn widen_recomputes_qty_with_smaller_position() {
+        // ARB-style scenario: tight stop → big qty. After widening: smaller qty.
+        // Risk = $0.30 on $300 balance, 0.1% risk. Entry $100.
+        // Scanner stop $100.10 → distance $0.10 → qty = 3.0
+        // Widened stop (0.5% min) → $100.50 → distance $0.50 → qty = 0.6
+        let raw_q = compute_risk_qty("short", 100.0, 100.1, 300.0, 0.1).unwrap();
+        let widened = widen_stop_if_too_tight("short", 100.0, 100.1, 0.5);
+        let new_q = compute_risk_qty("short", 100.0, widened, 300.0, 0.1).unwrap();
+        assert!(raw_q > new_q, "widened stop should give a smaller qty");
+        assert!((new_q - 0.6).abs() < 1e-9);
     }
 }
