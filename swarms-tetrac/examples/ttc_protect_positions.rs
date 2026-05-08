@@ -16,17 +16,24 @@
 //!   cargo run --example ttc_protect_positions -p swarms-tetrac
 //!
 //! Tunable via env (all optional):
-//!   TRADE_EXCHANGE       default "phemex"
-//!   TICK_INTERVAL_SECS   default 60
-//!   MAX_TICKS            default 1 (set 0 to loop forever)
-//!   PROTECT_TIMEFRAME    default "1h"  (timeframe passed to get_scanner)
+//!   TRADE_EXCHANGE              default "phemex"
+//!   TICK_INTERVAL_SECS          default 60
+//!   MAX_TICKS                   default 1 (set 0 to loop forever)
+//!   PROTECT_TIMEFRAME           default "1h"  (timeframe passed to get_scanner)
+//!   PROTECT_FALLBACK_STOP_PCT   default 5     (fallback stop distance as % of
+//!                                              CURRENT mark price when scanner
+//!                                              has no stop_loss; e.g. 5 means a
+//!                                              short's stop sits 5% above mark.
+//!                                              Mark-based not entry-based so the
+//!                                              stop stays valid even when the
+//!                                              position has drifted underwater.)
 
 use std::env;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use skill_trading::models::{
-    LimitOrderParams, OrderSide, Position, StopOrderParams, TimeInForce,
+    LimitOrderParams, OrderSide, Position, PositionSide, StopOrderParams, TimeInForce,
 };
 use swarms_tetrac::TtcConfig;
 
@@ -102,7 +109,11 @@ async fn protect_pass(exchange: &str, timeframe: &str) -> Result<()> {
         let needs = match orphan_check(exchange, &pos.symbol).await {
             Ok(needs) => needs,
             Err(e) => {
-                tracing::error!(symbol = %pos.symbol, error = %e, "orphan check failed; skipping");
+                tracing::error!(
+                    symbol = %pos.symbol,
+                    error = format!("{e:#}"),
+                    "orphan check failed; skipping"
+                );
                 continue;
             }
         };
@@ -117,7 +128,11 @@ async fn protect_pass(exchange: &str, timeframe: &str) -> Result<()> {
             "orphan detected; placing protections"
         );
         if let Err(e) = protect_position(exchange, &pos, timeframe).await {
-            tracing::error!(symbol = %pos.symbol, error = %e, "protection failed");
+            tracing::error!(
+                symbol = %pos.symbol,
+                error = format!("{e:#}"),
+                "protection failed"
+            );
         }
     }
     Ok(())
@@ -158,12 +173,39 @@ async fn protect_position(exchange: &str, pos: &Position, timeframe: &str) -> Re
         .await
         .with_context(|| format!("get_scanner failed for {}", pos.symbol))?;
 
-    let stop_price = scan
-        .signal
-        .stop_loss
-        .ok_or_else(|| anyhow::anyhow!("scanner returned no stop_loss for {}", pos.symbol))?;
+    let stop_price = match scan.signal.stop_loss {
+        Some(s) if stop_is_valid_for_direction(direction, s, pos.mark_price) => s,
+        Some(s) => {
+            // Scanner gave a stop, but it's already past the market — phemex
+            // would reject it. Fall through to the mark-based fallback.
+            let pct = fallback_stop_pct();
+            let fallback = fallback_stop_price(direction, pos.mark_price, pct);
+            tracing::warn!(
+                symbol = %pos.symbol,
+                scanner_stop = s,
+                mark_price = pos.mark_price,
+                fallback_stop = fallback,
+                fallback_pct = pct,
+                "scanner stop already past mark; using % fallback from mark"
+            );
+            fallback
+        }
+        None => {
+            let pct = fallback_stop_pct();
+            let fallback = fallback_stop_price(direction, pos.mark_price, pct);
+            tracing::warn!(
+                symbol = %pos.symbol,
+                mark_price = pos.mark_price,
+                fallback_stop = fallback,
+                fallback_pct = pct,
+                "scanner has no stop_loss; using % fallback from mark"
+            );
+            fallback
+        }
+    };
 
-    place_stop(exchange, &pos.symbol, close_side, pos.size, stop_price).await?;
+    let pos_side = phemex_position_side(&pos.position_side);
+    place_stop(exchange, &pos.symbol, close_side, pos_side, pos.size, stop_price).await?;
 
     let tps: Vec<f64> = [
         scan.signal.take_profit1,
@@ -183,8 +225,13 @@ async fn protect_position(exchange: &str, pos: &Position, timeframe: &str) -> Re
         if *qty <= 0.0 {
             continue;
         }
-        if let Err(e) = place_tp(exchange, &pos.symbol, close_side, *qty, *price).await {
-            tracing::error!(symbol = %pos.symbol, tp_price = price, error = %e, "TP placement failed");
+        if let Err(e) = place_tp(exchange, &pos.symbol, close_side, pos_side, *qty, *price).await {
+            tracing::error!(
+                symbol = %pos.symbol,
+                tp_price = price,
+                error = format!("{e:#}"),
+                "TP placement failed"
+            );
         }
     }
     Ok(())
@@ -194,6 +241,7 @@ async fn place_stop(
     exchange: &str,
     symbol: &str,
     close_side: OrderSide,
+    pos_side: PositionSide,
     quantity: f64,
     stop_price: f64,
 ) -> Result<()> {
@@ -204,13 +252,21 @@ async fn place_stop(
         side: close_side,
         quantity,
         stop_price,
-        position_side: None,
+        position_side: Some(pos_side),
         trigger_type: None,
         price: None,
         close_position: None,
         reduce_only: Some(true),
         client_order_id: None,
     };
+    tracing::info!(
+        symbol,
+        side = ?close_side,
+        quantity,
+        stop_price,
+        reduce_only = true,
+        "submitting stop-market order"
+    );
     if rt.dry_run {
         tracing::info!(symbol, quantity, stop_price, "dry-run: would place stop-loss");
         return Ok(());
@@ -228,6 +284,7 @@ async fn place_tp(
     exchange: &str,
     symbol: &str,
     close_side: OrderSide,
+    pos_side: PositionSide,
     quantity: f64,
     tp_price: f64,
 ) -> Result<()> {
@@ -238,13 +295,21 @@ async fn place_tp(
         side: close_side,
         quantity,
         price: tp_price,
-        position_side: None,
+        position_side: Some(pos_side),
         time_in_force: Some(TimeInForce::GoodTillCancel),
         reduce_only: Some(true),
         take_profit_price: None,
         stop_loss_price: None,
         client_order_id: None,
     };
+    tracing::info!(
+        symbol,
+        side = ?close_side,
+        quantity,
+        tp_price,
+        reduce_only = true,
+        "submitting TP limit order"
+    );
     if rt.dry_run {
         tracing::info!(symbol, quantity, tp_price, "dry-run: would place TP limit");
         return Ok(());
@@ -256,6 +321,51 @@ async fn place_tp(
         .context("place_limit_order failed")?;
     tracing::info!(symbol, quantity, tp_price, ?order, "TP limit placed");
     Ok(())
+}
+
+/// Map the position's reported `position_side` string into the enum value
+/// the API expects on follow-on orders. Phemex (and the ttc.box bridge)
+/// requires posSide on every order or it returns 500. "merged"/"both" /
+/// empty all map to PositionSide::Both — the one-way mode default. Hedge-
+/// mode accounts return "long"/"short" explicitly and we pass that through.
+fn phemex_position_side(reported: &str) -> PositionSide {
+    match reported.trim().to_lowercase().as_str() {
+        "long" => PositionSide::Long,
+        "short" => PositionSide::Short,
+        _ => PositionSide::Both,
+    }
+}
+
+/// Stop price relative to the supplied base (typically `position.mark_price`,
+/// i.e. current market). For a short the stop sits above the mark by `pct`;
+/// for a long, below. Mark-based so the stop is always valid even when the
+/// position has drifted past wherever the original entry was.
+fn fallback_stop_price(direction: &str, base_price: f64, pct: f64) -> f64 {
+    let factor = pct / 100.0;
+    match direction {
+        "short" => base_price * (1.0 + factor),
+        "long" => base_price * (1.0 - factor),
+        _ => base_price,
+    }
+}
+
+/// Phemex rejects a stop that's already past the mark (a buy-stop below
+/// market for a short, or a sell-stop above market for a long — those would
+/// trigger instantly). Use this to decide whether to trust the scanner's
+/// stop or fall back to a mark-based one.
+fn stop_is_valid_for_direction(direction: &str, stop: f64, mark: f64) -> bool {
+    match direction {
+        "short" => stop > mark,
+        "long" => stop < mark,
+        _ => false,
+    }
+}
+
+fn fallback_stop_pct() -> f64 {
+    env::var("PROTECT_FALLBACK_STOP_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(5.0)
 }
 
 fn round_qty(qty: f64, price: f64) -> f64 {
@@ -306,5 +416,52 @@ mod tests {
     #[test]
     fn round_qty_sub_dollar() {
         assert!((round_qty(526.7, 0.0277) - 527.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fallback_short_puts_stop_above_mark() {
+        let s = fallback_stop_price("short", 0.02797, 5.0);
+        assert!(s > 0.02797);
+    }
+
+    #[test]
+    fn fallback_long_puts_stop_below_mark() {
+        let s = fallback_stop_price("long", 100.0, 5.0);
+        assert!((s - 95.0).abs() < 1e-9);
+        assert!(s < 100.0);
+    }
+
+    #[test]
+    fn fallback_unknown_direction_returns_base() {
+        let s = fallback_stop_price("merged", 100.0, 5.0);
+        assert_eq!(s, 100.0);
+    }
+
+    #[test]
+    fn stop_validity_short() {
+        // For shorts: stop must be ABOVE mark.
+        assert!(stop_is_valid_for_direction("short", 0.028, 0.027));
+        assert!(!stop_is_valid_for_direction("short", 0.026, 0.027));
+        assert!(!stop_is_valid_for_direction("short", 0.027, 0.027));
+    }
+
+    #[test]
+    fn stop_validity_long() {
+        // For longs: stop must be BELOW mark.
+        assert!(stop_is_valid_for_direction("long", 95.0, 100.0));
+        assert!(!stop_is_valid_for_direction("long", 105.0, 100.0));
+    }
+
+    #[test]
+    fn phemex_pos_side_merged_is_both() {
+        assert!(matches!(phemex_position_side("merged"), PositionSide::Both));
+        assert!(matches!(phemex_position_side("MERGED"), PositionSide::Both));
+        assert!(matches!(phemex_position_side(""), PositionSide::Both));
+    }
+
+    #[test]
+    fn phemex_pos_side_hedge_modes_pass_through() {
+        assert!(matches!(phemex_position_side("long"), PositionSide::Long));
+        assert!(matches!(phemex_position_side("Short"), PositionSide::Short));
     }
 }

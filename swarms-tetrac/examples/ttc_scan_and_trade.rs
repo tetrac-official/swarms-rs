@@ -586,7 +586,11 @@ async fn place_post_trade_orders(
     };
 
     if let Err(e) = place_stop_loss_order(exchange, symbol, close_side, position_size, stop_price).await {
-        tracing::error!(error = %e, stop_price, "stop-loss placement FAILED — set one manually");
+        tracing::error!(
+            error = format!("{e:#}"),
+            stop_price,
+            "stop-loss placement FAILED — set one manually"
+        );
     }
 
     if tp_prices.is_empty() {
@@ -605,7 +609,11 @@ async fn place_post_trade_orders(
         )
         .await
         {
-            tracing::error!(error = %e, tp_price, "TP limit placement failed");
+            tracing::error!(
+                error = format!("{e:#}"),
+                tp_price,
+                "TP limit placement failed"
+            );
         }
     }
 }
