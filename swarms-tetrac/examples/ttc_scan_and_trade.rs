@@ -19,10 +19,20 @@
 //!   MAX_TICKS            default 2 (set "0" or unset for forever)
 //!   TRADE_EXCHANGE       default "orderly"
 //!   TRADE_SYMBOL         default "BTCUSDT"
-//!   TRADE_USD_PCT        default "5"   (percent of free USDC per trade)
+//!   TRADE_RISK_PCT       default "1"   (percent of balance to lose if stop hits)
 //!   COOLDOWN_SECS        default 300   (skip ticks for N secs after a trade)
 //!   RATE_LIMIT_BACKOFF_SECS default 60 (sleep after agent returns empty)
 //!   SKILL_TRADING_BIN    default <repo path>; needed for refresh_auth
+//!
+//! Sizing model (perp-aware, risk-based):
+//!   loss_per_token = abs(entry - stop_loss)
+//!   risk_amount    = balance × TRADE_RISK_PCT / 100
+//!   qty            = risk_amount / loss_per_token
+//!   notional       = qty × entry      (capped at 50× balance as a sanity bound)
+//!
+//! Leverage is whatever the exchange-side account is configured at — the
+//! daemon does not call set_leverage. Risk math is leverage-independent;
+//! leverage only changes margin requirements, not the size of the trade.
 
 use std::env;
 use std::time::Duration;
@@ -53,10 +63,10 @@ async fn main() -> Result<()> {
     let rate_limit_backoff_secs: u64 = env_u64("RATE_LIMIT_BACKOFF_SECS", 60);
     let exchange = env::var("TRADE_EXCHANGE").unwrap_or_else(|_| "orderly".into());
     let symbol = env::var("TRADE_SYMBOL").unwrap_or_else(|_| "BTCUSDT".into());
-    let usd_pct: f64 = env::var("TRADE_USD_PCT")
+    let risk_pct: f64 = env::var("TRADE_RISK_PCT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5.0);
+        .unwrap_or(1.0);
 
     let base_url = env::var("OPENAI_BASE_URL").context("OPENAI_BASE_URL not set")?;
     let api_key = env::var("OPENAI_API_KEY").context("OPENAI_API_KEY not set")?;
@@ -84,17 +94,19 @@ async fn main() -> Result<()> {
              2. get_funding_rates symbol=\"{symbol}\".\n\
              3. Output ONE LINE:\n\
                 \"signal direction=<long|short|neutral> confidence=<low|medium|high> \
-                entry=<price|n/a> funding_bias=<long|short|mixed|neutral>\"\n\
+                entry=<price|n/a> stop_loss=<price|n/a> \
+                funding_bias=<long|short|mixed|neutral>\"\n\
              4. End with <DONE>.\n\
              \n\
              Field rules:\n\
              - direction = scanner signal.direction (lowercase)\n\
              - confidence = scanner signal.confidence (lowercase)\n\
              - entry = scanner signal.entry, or n/a if missing\n\
+             - stop_loss = scanner signal.stopLoss, or n/a if missing\n\
              - funding_bias: long if rates mostly positive, short if mostly negative, \
                mixed if split, neutral if no data\n\
              - If get_scanner errors, output direction=neutral confidence=low entry=n/a \
-               funding_bias=neutral and stop."
+               stop_loss=n/a funding_bias=neutral and stop."
         ))
         .add_tool(GetScannerTool)
         .add_tool(GetFundingRatesTool)
@@ -150,27 +162,19 @@ async fn main() -> Result<()> {
             "You are a TTC trade executor for exchange=\"{exchange}\" symbol=\"{symbol}\".\n\
              Tools: place_market_order.\n\
              \n\
-             You receive upstream signal and risk lines as input.\n\
+             You receive a [trade] section with side and quantity precomputed by the \
+             daemon. Place that exact order. Do NOT recompute, scale, round, or alter \
+             the quantity — the daemon has already done risk-based sizing.\n\
              \n\
-             - If risk verdict is SKIP: do NOT call any tool. Output the cycle line \
-               with action=SKIP and reason copied from the upstream risk reason. \
-               End with <DONE>.\n\
-             - If risk verdict is PROCEED:\n\
-               1. Compute qty = ({usd_pct}% of usd_available) / entry. Round sensibly: \
-                  BTC/ETH-priced symbols use 4 decimals; mid-priced use 2; sub-$1 use 0. \
-                  If qty rounds to 0, output action=SKIP reason=qty-too-small (no tool call).\n\
-               2. side = signal direction (long or short).\n\
-               3. place_market_order exchange=\"{exchange}\" symbol=\"{symbol}\" \
-                  side=<side> quantity=<qty> EXACTLY ONCE.\n\
-               4. Output the cycle line with action=TRADE.\n\
+             Steps:\n\
+             1. place_market_order exchange=\"{exchange}\" symbol=\"{symbol}\" \
+                side=<side from [trade]> quantity=<quantity from [trade]> EXACTLY ONCE.\n\
+             2. Output the cycle line with action=TRADE.\n\
              \n\
              Cycle line format (always exactly):\n\
-             \"cycle <n>: action=<TRADE|SKIP> exchange={exchange} symbol={symbol} \
-             side=<long|short|n/a> qty=<q|n/a> reason=<single-word-or-hyphenated> \
+             \"cycle <n>: action=TRADE exchange={exchange} symbol={symbol} \
+             side=<long|short> qty=<quantity from [trade]> reason=signal-confirmed \
              dry_run=<true|false>\"\n\
-             \n\
-             reason MUST be a single word or hyphenated tokens — no spaces, no quotes. \
-             Examples: \"neutral\", \"low-confidence\", \"no-stablecoin\", \"signal-confirmed\", \"qty-too-small\".\n\
              \n\
              End with <DONE>.\n\
              \n\
@@ -196,7 +200,7 @@ async fn main() -> Result<()> {
     );
     eprintln!(
         "ttc_scan_and_trade: 3-agent pipeline | interval={interval_secs}s max_ticks={} \
-         exchange={exchange} symbol={symbol} usd_pct={usd_pct} cooldown={cooldown_secs}s \
+         exchange={exchange} symbol={symbol} risk_pct={risk_pct}% cooldown={cooldown_secs}s \
          rate_limit_backoff={rate_limit_backoff_secs}s",
         if max_ticks == 0 {
             "∞".into()
@@ -285,8 +289,42 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // Risk-based qty sizing in Rust, not the LLM. Pull entry,
+                // stop_loss, direction from the signal line; usd_available
+                // from the risk line. If anything is missing or the math
+                // fails sanity bounds, skip with a specific reason instead
+                // of feeding garbage to the executor.
+                let direction = kv(&signal, "direction").unwrap_or_default();
+                let entry = kv(&signal, "entry").and_then(|v| v.parse::<f64>().ok());
+                let stop = kv(&signal, "stop_loss").and_then(|v| v.parse::<f64>().ok());
+                let balance = kv(&risk, "usd_available").and_then(|v| v.parse::<f64>().ok());
+                let (entry, stop, balance) = match (entry, stop, balance) {
+                    (Some(e), Some(s), Some(b)) => (e, s, b),
+                    _ => {
+                        return Ok(CycleOutcome::Skip {
+                            reason: "missing-sizing-input".into(),
+                        });
+                    }
+                };
+                let qty = match compute_risk_qty(&direction, entry, stop, balance, risk_pct) {
+                    Ok(raw) => round_qty_for_price(raw, entry),
+                    Err(reason) => {
+                        return Ok(CycleOutcome::Skip {
+                            reason: format!("sizing-{reason}"),
+                        });
+                    }
+                };
+                if qty <= 0.0 {
+                    return Ok(CycleOutcome::Skip {
+                        reason: "qty-rounds-to-zero".into(),
+                    });
+                }
+
                 let exec_prompt = format!(
-                    "cycle {cycle}\n\n[signal]:\n{signal}\n\n[risk]:\n{risk}"
+                    "cycle {cycle}\n\n\
+                     [signal]:\n{signal}\n\n\
+                     [risk]:\n{risk}\n\n\
+                     [trade]:\nside={direction} quantity={qty}"
                 );
                 let exec_output = with_auth_refresh(|| async {
                     executor.run(exec_prompt.clone()).await.map_err(|e| {
@@ -309,6 +347,71 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// Risk-based position size: how many tokens to buy/sell so that hitting
+/// the stop-loss costs exactly `risk_pct` percent of `balance`.
+///
+///   loss_per_token = abs(entry - stop_loss)
+///   risk_amount    = balance × risk_pct / 100
+///   qty            = risk_amount / loss_per_token
+///
+/// Validates the stop is on the correct side of entry for the direction
+/// (longs need stop below entry; shorts need stop above) and caps notional
+/// at 50× balance — pros set their own risk, but if the math somehow asks
+/// for a $15k position on a $300 account, something's wrong upstream and
+/// we'd rather skip than place it.
+fn compute_risk_qty(
+    direction: &str,
+    entry: f64,
+    stop_loss: f64,
+    balance: f64,
+    risk_pct: f64,
+) -> Result<f64, String> {
+    if !entry.is_finite() || entry <= 0.0 {
+        return Err("invalid-entry".into());
+    }
+    if !stop_loss.is_finite() || stop_loss <= 0.0 {
+        return Err("invalid-stop".into());
+    }
+    if !balance.is_finite() || balance <= 0.0 {
+        return Err("invalid-balance".into());
+    }
+    if !risk_pct.is_finite() || risk_pct <= 0.0 {
+        return Err("invalid-risk-pct".into());
+    }
+    match direction {
+        "long" if stop_loss >= entry => return Err("stop-not-below-entry".into()),
+        "short" if stop_loss <= entry => return Err("stop-not-above-entry".into()),
+        "long" | "short" => {}
+        _ => return Err("invalid-direction".into()),
+    }
+    let distance = (entry - stop_loss).abs();
+    if distance <= 0.0 {
+        return Err("zero-distance".into());
+    }
+    let risk_amount = balance * risk_pct / 100.0;
+    let qty = risk_amount / distance;
+    let notional = qty * entry;
+    let max_notional = balance * 50.0;
+    if notional > max_notional {
+        return Err("notional-exceeds-50x-balance".into());
+    }
+    Ok(qty)
+}
+
+/// Round a raw qty to a sensible precision based on the symbol's price.
+/// High-priced (BTC/ETH-shaped) get 4 decimals; mid-priced 2; sub-$1 zero
+/// (whole tokens). Uses a multiplier-then-round to avoid float-format hell.
+fn round_qty_for_price(qty: f64, price: f64) -> f64 {
+    let scale: f64 = if price > 100.0 {
+        10_000.0
+    } else if price >= 1.0 {
+        100.0
+    } else {
+        1.0
+    };
+    (qty * scale).round() / scale
 }
 
 /// Pure logic for conflict detection — picks the first non-empty position
@@ -525,5 +628,79 @@ mod tests {
         // A zero-size entry might appear briefly after a close; treat as no conflict.
         let positions = vec![pos("BTCUSDT", "buy", 0.0)];
         assert!(detect_position_conflict(&positions, "BTCUSDT").is_none());
+    }
+
+    // Risk-based sizing math.
+
+    #[test]
+    fn risk_qty_short_basic() {
+        // $300 balance, 1% risk = $3.
+        // Short BTC, entry=80000, stop=80800 → distance=800.
+        // qty = 3 / 800 = 0.00375 → notional ~ $300 (very small position).
+        let qty = compute_risk_qty("short", 80000.0, 80800.0, 300.0, 1.0).unwrap();
+        assert!((qty - 0.00375).abs() < 1e-9);
+    }
+
+    #[test]
+    fn risk_qty_long_basic() {
+        // Long ZRO, entry=$1.50, stop=$1.45 → distance=$0.05.
+        // $300 × 1% = $3 risk → qty = 3 / 0.05 = 60.
+        let qty = compute_risk_qty("long", 1.50, 1.45, 300.0, 1.0).unwrap();
+        assert!((qty - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn risk_qty_long_with_stop_above_entry_is_invalid() {
+        // For a long, stop must be BELOW entry. This catches scanner output
+        // where the side and stop are inconsistent.
+        let err = compute_risk_qty("long", 100.0, 105.0, 300.0, 1.0).unwrap_err();
+        assert_eq!(err, "stop-not-below-entry");
+    }
+
+    #[test]
+    fn risk_qty_short_with_stop_below_entry_is_invalid() {
+        let err = compute_risk_qty("short", 100.0, 95.0, 300.0, 1.0).unwrap_err();
+        assert_eq!(err, "stop-not-above-entry");
+    }
+
+    #[test]
+    fn risk_qty_caps_at_50x_balance() {
+        // Tiny stop distance would explode the position size. Cap kicks in.
+        let err = compute_risk_qty("long", 1000.0, 999.99, 300.0, 1.0).unwrap_err();
+        assert_eq!(err, "notional-exceeds-50x-balance");
+    }
+
+    #[test]
+    fn risk_qty_rejects_zero_distance() {
+        let err = compute_risk_qty("long", 100.0, 100.0, 300.0, 1.0).unwrap_err();
+        // Stop equals entry: caught by stop-not-below-entry first.
+        assert_eq!(err, "stop-not-below-entry");
+    }
+
+    #[test]
+    fn risk_qty_rejects_garbage_inputs() {
+        assert!(compute_risk_qty("long", f64::NAN, 95.0, 300.0, 1.0).is_err());
+        assert!(compute_risk_qty("long", 100.0, f64::INFINITY, 300.0, 1.0).is_err());
+        assert!(compute_risk_qty("long", 100.0, 95.0, 0.0, 1.0).is_err());
+        assert!(compute_risk_qty("long", 100.0, 95.0, 300.0, 0.0).is_err());
+        assert!(compute_risk_qty("sideways", 100.0, 95.0, 300.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn round_qty_high_priced_uses_4_decimals() {
+        // BTC at $80k: 0.000186 → 0.0002 (round to 4)
+        assert!((round_qty_for_price(0.000186, 80000.0) - 0.0002).abs() < 1e-9);
+    }
+
+    #[test]
+    fn round_qty_mid_priced_uses_2_decimals() {
+        // ZRO at $1.50: 9.572 → 9.57 (round to 2)
+        assert!((round_qty_for_price(9.572, 1.50) - 9.57).abs() < 1e-9);
+    }
+
+    #[test]
+    fn round_qty_sub_dollar_uses_whole_tokens() {
+        // SWARMS at $0.0277: 526.7 → 527 (round to 0)
+        assert!((round_qty_for_price(526.7, 0.0277) - 527.0).abs() < 1e-9);
     }
 }
