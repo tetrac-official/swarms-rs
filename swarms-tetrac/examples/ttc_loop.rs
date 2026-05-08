@@ -93,12 +93,23 @@ async fn main() -> Result<()> {
         }
     );
 
+    let max_token_age = Duration::from_secs(23 * 3600);
     let mut pass: u64 = 0;
     loop {
         if max_passes != 0 && pass >= max_passes {
             break;
         }
         pass += 1;
+
+        // Proactive: if the 24h TTC session token is older than 23h, run
+        // `skill-trading login` to refresh it before any API calls. Cheap
+        // (free, env-only) when fresh; one subprocess call when stale.
+        if let Err(e) = swarms_tetrac::refresh_if_stale(max_token_age).await {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "proactive token refresh failed; continuing with current token"
+            );
+        }
 
         let balance = match fetch_usd_balance(&exchange).await {
             Ok(b) => b,
