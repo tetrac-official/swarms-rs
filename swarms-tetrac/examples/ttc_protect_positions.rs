@@ -27,13 +27,20 @@
 //!                                              Mark-based not entry-based so the
 //!                                              stop stays valid even when the
 //!                                              position has drifted underwater.)
+//!   PROTECT_TP_LAYER_THRESHOLD  default 30    (notional $ above which we layer
+//!                                              up to 3 TPs; at or below, single
+//!                                              TP — exchange-min-order driven)
+//!   PROTECT_FALLBACK_TP_STEP_PCT default 2.5  (% step between fallback TPs when
+//!                                              scanner gives none. TP_n sits at
+//!                                              n × step from mark, on the
+//!                                              profitable side of the position.)
 
 use std::env;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use skill_trading::models::{
-    LimitOrderParams, OrderSide, Position, PositionSide, StopOrderParams, TimeInForce,
+    LimitOrderParams, Order, OrderSide, Position, PositionSide, StopOrderParams, TimeInForce,
 };
 use swarms_tetrac::TtcConfig;
 
@@ -106,27 +113,6 @@ async fn protect_pass(exchange: &str, timeframe: &str) -> Result<()> {
         if pos.size <= 0.0 {
             continue;
         }
-        let needs = match orphan_check(exchange, &pos.symbol).await {
-            Ok(needs) => needs,
-            Err(e) => {
-                tracing::error!(
-                    symbol = %pos.symbol,
-                    error = format!("{e:#}"),
-                    "orphan check failed; skipping"
-                );
-                continue;
-            }
-        };
-        if !needs {
-            tracing::info!(symbol = %pos.symbol, "already has open orders; assuming protected");
-            continue;
-        }
-        tracing::info!(
-            symbol = %pos.symbol,
-            size = pos.size,
-            side = %pos.side,
-            "orphan detected; placing protections"
-        );
         if let Err(e) = protect_position(exchange, &pos, timeframe).await {
             tracing::error!(
                 symbol = %pos.symbol,
@@ -138,12 +124,40 @@ async fn protect_pass(exchange: &str, timeframe: &str) -> Result<()> {
     Ok(())
 }
 
-/// Heuristic: a position is "orphaned" if it has zero open orders on its
-/// symbol. Phemex (and most exchanges) list outstanding stops and TP limits
-/// alongside regular orders, so this catches both. False negatives are
-/// possible if the user has unrelated open orders — log and skip in that
-/// case rather than risk duplicates.
-async fn orphan_check(exchange: &str, symbol: &str) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrderState {
+    has_stop: bool,
+    has_tp: bool,
+}
+
+/// Detect whether the existing open orders on a symbol already cover the
+/// stop and TP roles. We only care about orders on the *closing* side
+/// (sell for longs, buy for shorts) because that's the only direction
+/// that protects a position; user-placed entry orders on the same side
+/// as the position aren't protections.
+fn analyze_orders(orders: &[Order], direction: &str) -> OrderState {
+    let close = match direction {
+        "long" => "sell",
+        "short" => "buy",
+        _ => "",
+    };
+    let mut has_stop = false;
+    let mut has_tp = false;
+    for o in orders {
+        if !o.side.eq_ignore_ascii_case(close) {
+            continue;
+        }
+        let kind = o.order_type.to_lowercase();
+        if kind.contains("stop") {
+            has_stop = true;
+        } else if kind == "limit" {
+            has_tp = true;
+        }
+    }
+    OrderState { has_stop, has_tp }
+}
+
+async fn list_orders(exchange: &str, symbol: &str) -> Result<Vec<Order>> {
     let rt = swarms_tetrac::client::runtime()?;
     let creds = swarms_tetrac::client::credentials_for(exchange)?;
     let orders = rt
@@ -151,7 +165,7 @@ async fn orphan_check(exchange: &str, symbol: &str) -> Result<bool> {
         .get_orders(exchange, Some(symbol), creds)
         .await
         .with_context(|| format!("get_orders failed for {exchange} {symbol}"))?;
-    Ok(orders.is_empty())
+    Ok(orders)
 }
 
 async fn protect_position(exchange: &str, pos: &Position, timeframe: &str) -> Result<()> {
@@ -165,6 +179,28 @@ async fn protect_position(exchange: &str, pos: &Position, timeframe: &str) -> Re
         "short" => OrderSide::Buy,
         _ => unreachable!(),
     };
+    let pos_side = phemex_position_side(&pos.position_side);
+
+    let orders = list_orders(exchange, &pos.symbol).await?;
+    let state = analyze_orders(&orders, direction);
+    if state.has_stop && state.has_tp {
+        tracing::info!(
+            symbol = %pos.symbol,
+            "stop + TP already in place; nothing to do"
+        );
+        return Ok(());
+    }
+
+    let notional = position_notional(pos);
+    tracing::info!(
+        symbol = %pos.symbol,
+        size = pos.size,
+        side = %pos.side,
+        notional,
+        has_stop = state.has_stop,
+        has_tp = state.has_tp,
+        "protecting position"
+    );
 
     let rt = swarms_tetrac::client::runtime()?;
     let scan = rt
@@ -173,66 +209,91 @@ async fn protect_position(exchange: &str, pos: &Position, timeframe: &str) -> Re
         .await
         .with_context(|| format!("get_scanner failed for {}", pos.symbol))?;
 
-    let stop_price = match scan.signal.stop_loss {
-        Some(s) if stop_is_valid_for_direction(direction, s, pos.mark_price) => s,
-        Some(s) => {
-            // Scanner gave a stop, but it's already past the market — phemex
-            // would reject it. Fall through to the mark-based fallback.
-            let pct = fallback_stop_pct();
-            let fallback = fallback_stop_price(direction, pos.mark_price, pct);
-            tracing::warn!(
-                symbol = %pos.symbol,
-                scanner_stop = s,
-                mark_price = pos.mark_price,
-                fallback_stop = fallback,
-                fallback_pct = pct,
-                "scanner stop already past mark; using % fallback from mark"
-            );
-            fallback
-        }
-        None => {
-            let pct = fallback_stop_pct();
-            let fallback = fallback_stop_price(direction, pos.mark_price, pct);
-            tracing::warn!(
-                symbol = %pos.symbol,
-                mark_price = pos.mark_price,
-                fallback_stop = fallback,
-                fallback_pct = pct,
-                "scanner has no stop_loss; using % fallback from mark"
-            );
-            fallback
-        }
-    };
-
-    let pos_side = phemex_position_side(&pos.position_side);
-    place_stop(exchange, &pos.symbol, close_side, pos_side, pos.size, stop_price).await?;
-
-    let tps: Vec<f64> = [
-        scan.signal.take_profit1,
-        scan.signal.take_profit2,
-        scan.signal.take_profit3,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if tps.is_empty() {
-        tracing::info!(symbol = %pos.symbol, "no TP levels in scan output; stop-only");
-        return Ok(());
+    if !state.has_stop {
+        let stop_price = match scan.signal.stop_loss {
+            Some(s) if stop_is_valid_for_direction(direction, s, pos.mark_price) => s,
+            Some(s) => {
+                let pct = fallback_stop_pct();
+                let fallback = fallback_stop_price(direction, pos.mark_price, pct);
+                tracing::warn!(
+                    symbol = %pos.symbol,
+                    scanner_stop = s,
+                    mark_price = pos.mark_price,
+                    fallback_stop = fallback,
+                    fallback_pct = pct,
+                    "scanner stop already past mark; using % fallback from mark"
+                );
+                fallback
+            }
+            None => {
+                let pct = fallback_stop_pct();
+                let fallback = fallback_stop_price(direction, pos.mark_price, pct);
+                tracing::warn!(
+                    symbol = %pos.symbol,
+                    mark_price = pos.mark_price,
+                    fallback_stop = fallback,
+                    fallback_pct = pct,
+                    "scanner has no stop_loss; using % fallback from mark"
+                );
+                fallback
+            }
+        };
+        place_stop(exchange, &pos.symbol, close_side, pos_side, pos.size, stop_price).await?;
+    } else {
+        tracing::info!(symbol = %pos.symbol, "stop already present; skipping");
     }
 
-    let chunks = split_qty(pos.size, tps.len(), scan.signal.entry);
-    for (price, qty) in tps.iter().zip(chunks.iter()) {
-        if *qty <= 0.0 {
-            continue;
-        }
-        if let Err(e) = place_tp(exchange, &pos.symbol, close_side, pos_side, *qty, *price).await {
-            tracing::error!(
+    if !state.has_tp {
+        let target = target_tp_count(notional, tp_layer_threshold());
+        let scanner_tps: Vec<f64> = [
+            scan.signal.take_profit1,
+            scan.signal.take_profit2,
+            scan.signal.take_profit3,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|&p| tp_is_valid_for_direction(direction, p, pos.mark_price))
+        .collect();
+
+        let tps: Vec<f64> = if scanner_tps.is_empty() {
+            let step = fallback_tp_step_pct();
+            let synth = fallback_tp_prices(direction, pos.mark_price, step, target);
+            tracing::warn!(
                 symbol = %pos.symbol,
-                tp_price = price,
-                error = format!("{e:#}"),
-                "TP placement failed"
+                mark_price = pos.mark_price,
+                step_pct = step,
+                count = synth.len(),
+                "scanner has no usable TP levels; using mark-based fallback"
             );
+            synth
+        } else {
+            scanner_tps.into_iter().take(target).collect()
+        };
+
+        let n = tps.len();
+        let chunks = split_qty(pos.size, n, scan.signal.entry);
+        tracing::info!(
+            symbol = %pos.symbol,
+            notional,
+            target_tps = target,
+            placing_tps = n,
+            "layering take-profit limits"
+        );
+        for (price, qty) in tps.iter().zip(chunks.iter()) {
+            if *qty <= 0.0 {
+                continue;
+            }
+            if let Err(e) = place_tp(exchange, &pos.symbol, close_side, pos_side, *qty, *price).await {
+                tracing::error!(
+                    symbol = %pos.symbol,
+                    tp_price = price,
+                    error = format!("{e:#}"),
+                    "TP placement failed"
+                );
+            }
         }
+    } else {
+        tracing::info!(symbol = %pos.symbol, "TP already present; skipping");
     }
     Ok(())
 }
@@ -368,6 +429,62 @@ fn fallback_stop_pct() -> f64 {
         .unwrap_or(5.0)
 }
 
+fn tp_layer_threshold() -> f64 {
+    env::var("PROTECT_TP_LAYER_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(30.0)
+}
+
+/// Number of TP orders to place. Above the threshold (default $30 notional)
+/// we layer up to 3; at or below, a single TP (exchange-min-order driven —
+/// splitting a $30 position into 3 makes the chunks too small to fill).
+fn target_tp_count(notional: f64, threshold: f64) -> usize {
+    if notional > threshold { 3 } else { 1 }
+}
+
+/// Position notional in USD. Prefer the position's reported notional when
+/// available; fall back to size × mark for exchanges that don't populate it.
+fn position_notional(pos: &Position) -> f64 {
+    pos.notional.unwrap_or(pos.size * pos.mark_price)
+}
+
+fn fallback_tp_step_pct() -> f64 {
+    env::var("PROTECT_FALLBACK_TP_STEP_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(2.5)
+}
+
+/// Synthesize TP prices when the scanner gives none. TP_n sits at
+/// n × step_pct from mark on the profitable side: below mark for shorts
+/// (price needs to drop), above for longs.
+fn fallback_tp_prices(direction: &str, mark: f64, step_pct: f64, n: usize) -> Vec<f64> {
+    if n == 0 || mark <= 0.0 || step_pct <= 0.0 {
+        return Vec::new();
+    }
+    let factor = step_pct / 100.0;
+    (1..=n)
+        .filter_map(|i| match direction {
+            "long" => Some(mark * (1.0 + factor * i as f64)),
+            "short" => Some(mark * (1.0 - factor * i as f64)),
+            _ => None,
+        })
+        .filter(|&p| p > 0.0)
+        .collect()
+}
+
+/// Phemex rejects a TP-limit on the wrong side of mark just like a stop.
+/// For a short, the TP must be BELOW mark (we profit when price drops).
+/// For a long, ABOVE.
+fn tp_is_valid_for_direction(direction: &str, tp: f64, mark: f64) -> bool {
+    match direction {
+        "short" => tp < mark,
+        "long" => tp > mark,
+        _ => false,
+    }
+}
+
 fn round_qty(qty: f64, price: f64) -> f64 {
     let scale: f64 = if price > 100.0 {
         10_000.0
@@ -463,5 +580,109 @@ mod tests {
     fn phemex_pos_side_hedge_modes_pass_through() {
         assert!(matches!(phemex_position_side("long"), PositionSide::Long));
         assert!(matches!(phemex_position_side("Short"), PositionSide::Short));
+    }
+
+    #[test]
+    fn target_tp_count_above_threshold() {
+        assert_eq!(target_tp_count(31.0, 30.0), 3);
+        assert_eq!(target_tp_count(100.0, 30.0), 3);
+    }
+
+    #[test]
+    fn target_tp_count_at_or_below_threshold() {
+        assert_eq!(target_tp_count(30.0, 30.0), 1);
+        assert_eq!(target_tp_count(15.0, 30.0), 1);
+        assert_eq!(target_tp_count(0.01, 30.0), 1);
+    }
+
+    fn order(side: &str, order_type: &str) -> Order {
+        Order {
+            order_id: "x".into(),
+            symbol: "BTCUSDT".into(),
+            side: side.into(),
+            position_side: "merged".into(),
+            order_type: order_type.into(),
+            price: 0.0,
+            quantity: 1.0,
+            status: "new".into(),
+            timestamp: 0,
+            filled_quantity: None,
+            average_price: None,
+        }
+    }
+
+    #[test]
+    fn analyze_orders_detects_stop_for_short() {
+        // For a short, the closing side is buy. A buy-stop is the protection.
+        let orders = vec![order("buy", "stop")];
+        let s = analyze_orders(&orders, "short");
+        assert!(s.has_stop);
+        assert!(!s.has_tp);
+    }
+
+    #[test]
+    fn analyze_orders_detects_tp_for_long() {
+        // For a long, the closing side is sell. A sell-limit is the TP.
+        let orders = vec![order("sell", "limit")];
+        let s = analyze_orders(&orders, "long");
+        assert!(s.has_tp);
+        assert!(!s.has_stop);
+    }
+
+    #[test]
+    fn analyze_orders_detects_both() {
+        let orders = vec![order("buy", "stop"), order("buy", "limit")];
+        let s = analyze_orders(&orders, "short");
+        assert!(s.has_stop);
+        assert!(s.has_tp);
+    }
+
+    #[test]
+    fn analyze_orders_ignores_wrong_side_orders() {
+        // A user-placed entry order on the same side as the position is not
+        // a protection. For a short (entry side=sell), a sell-limit would
+        // be e.g. a planned add — don't count it as a TP.
+        let orders = vec![order("sell", "limit")];
+        let s = analyze_orders(&orders, "short");
+        assert!(!s.has_tp);
+        assert!(!s.has_stop);
+    }
+
+    #[test]
+    fn fallback_tp_short_below_mark_layered() {
+        // Mark $100, step 2.5%. Three TPs at 97.5, 95.0, 92.5.
+        let tps = fallback_tp_prices("short", 100.0, 2.5, 3);
+        assert_eq!(tps.len(), 3);
+        assert!((tps[0] - 97.5).abs() < 1e-9);
+        assert!((tps[1] - 95.0).abs() < 1e-9);
+        assert!((tps[2] - 92.5).abs() < 1e-9);
+        // All below mark.
+        assert!(tps.iter().all(|&p| p < 100.0));
+    }
+
+    #[test]
+    fn fallback_tp_long_above_mark_layered() {
+        let tps = fallback_tp_prices("long", 100.0, 2.5, 3);
+        assert_eq!(tps.len(), 3);
+        assert!(tps.iter().all(|&p| p > 100.0));
+    }
+
+    #[test]
+    fn fallback_tp_single() {
+        let tps = fallback_tp_prices("short", 100.0, 5.0, 1);
+        assert_eq!(tps.len(), 1);
+        assert!((tps[0] - 95.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tp_validity_short_must_be_below_mark() {
+        assert!(tp_is_valid_for_direction("short", 95.0, 100.0));
+        assert!(!tp_is_valid_for_direction("short", 105.0, 100.0));
+    }
+
+    #[test]
+    fn tp_validity_long_must_be_above_mark() {
+        assert!(tp_is_valid_for_direction("long", 105.0, 100.0));
+        assert!(!tp_is_valid_for_direction("long", 95.0, 100.0));
     }
 }
